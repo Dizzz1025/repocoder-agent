@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .config import get_settings
 from .models import CommandResult, PatchInstruction, RelevantFile
 from .repository import RepoFile, RepoSnapshot
 
-DEFAULT_OPENAI_BASE_URL = "https://api-inference.modelscope.cn/v1"
-DEFAULT_OPENAI_MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 MAX_CONTEXT_CHARS = 12_000
 MAX_FILE_CONTEXT_CHARS = 4_000
 
@@ -49,9 +47,9 @@ class SupportsRepoCoderLLM(Protocol):
     ) -> LLMRetrySuggestion | None: ...
 
 
-def create_llm_client_from_env() -> SupportsRepoCoderLLM | None:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+def create_llm_client_from_env(start_dir: str | None = None) -> SupportsRepoCoderLLM | None:
+    settings = get_settings(start_dir=start_dir)
+    if not settings.openai_api_key:
         return None
 
     try:
@@ -61,15 +59,15 @@ def create_llm_client_from_env() -> SupportsRepoCoderLLM | None:
 
     try:
         client = OpenAI(
-            base_url=os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
-            api_key=api_key,
+            base_url=settings.openai_base_url,
+            api_key=settings.openai_api_key,
         )
     except Exception:
         return None
 
     return OpenAICompatibleLLMClient(
         client=client,
-        model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        model=settings.openai_model,
     )
 
 

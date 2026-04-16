@@ -18,3 +18,5 @@ dist/
 build/
 .DS_Store
 Thumbs.db
+README2.md
+.env

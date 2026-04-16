@@ -5,8 +5,14 @@ from .models import PatchInstruction, RelevantFile
 
 
 class TaskPlanner:
-    def __init__(self, llm_client: SupportsRepoCoderLLM | None = None):
-        self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env()
+    def __init__(
+        self,
+        llm_client: SupportsRepoCoderLLM | None = None,
+        start_dir: str | None = None,
+    ):
+        self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env(
+            start_dir=start_dir
+        )
 
     def build_plan(
         self,

@@ -51,7 +51,7 @@ def plan_task(request: PlanRequest) -> PlanResponse:
         goal=request.goal,
         top_k=request.top_k_files,
     )
-    planner = TaskPlanner()
+    planner = TaskPlanner(start_dir=request.repository_path)
     plan_steps = planner.build_plan(
         goal=request.goal,
         relevant_files=relevant_files,

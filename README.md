@@ -51,9 +51,9 @@ repocoder-agent/
 ```bash
 python -m venv .venv
 # Windows
-.venv\Scripts\activate
+#.venv\Scripts\activate
 # macOS/Linux
-# source .venv/bin/activate
+source .venv/bin/activate
 
 pip install -e .[dev]
 ```
@@ -172,7 +172,7 @@ curl -X POST http://127.0.0.1:8000/run \
 你也可以直接运行示例脚本：
 
 ```bash
-python scripts/example_run.py /path/to/repo
+python scripts/example_run.py /root/autodl-tmp/test_repo
 ```
 
 ## 7. 自动修复策略

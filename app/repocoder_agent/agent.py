@@ -10,6 +10,7 @@ from .models import AgentRunResponse, AgentTaskRequest, AppliedPatch, CommandRes
 from .patcher import PatchApplier
 from .planner import TaskPlanner
 from .repository import RepoSnapshot, RepositoryScanner
+from .tracing import RunTraceWriter
 
 
 @dataclass
@@ -23,11 +24,14 @@ class RepoCoderAgent:
     def __init__(self, task: AgentTaskRequest, llm_client: SupportsRepoCoderLLM | None = None):
         self.task = task
         self.scanner = RepositoryScanner(task.repository_path)
-        self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env()
+        self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env(
+            start_dir=task.repository_path
+        )
         self.planner = TaskPlanner(llm_client=self.llm_client)
         self.patcher = PatchApplier(task.repository_path)
         self.executor = CommandExecutor(task.repository_path, timeout_sec=task.command_timeout_sec)
         self.auto_fixer = ErrorAutoFixer(task.repository_path)
+        self.trace_writer = RunTraceWriter(task.repository_path)
 
     def run(self) -> AgentRunResponse:
         snapshot = self.scanner.scan()
@@ -100,7 +104,7 @@ class RepoCoderAgent:
         if not state.success and not state.message:
             state.message = "Run completed with failures."
 
-        return AgentRunResponse(
+        response = AgentRunResponse(
             success=state.success,
             summary=snapshot.summary,
             relevant_files=relevant_files,
@@ -110,6 +114,13 @@ class RepoCoderAgent:
             iterations_used=state.iterations_used,
             message=state.message,
         )
+        self.trace_writer.write_run(
+            request=self.task,
+            summary=snapshot.summary,
+            relevant_files=relevant_files,
+            response=response,
+        )
+        return response
 
     def _suggest_retry_patch(
         self,
@@ -150,7 +161,7 @@ class RepoCoderAgent:
                 return inferred
 
         english = re.search(
-            r"in\s+([A-Za-z0-9_./\\-]+\.py)\s+replace\s+`([^`]+)`\s+with\s+`([^`]+)`",
+            r"in\s+([A-Za-z0-9_./\-]+\.py)\s+replace\s+`([^`]+)`\s+with\s+`([^`]+)`",
             self.task.goal,
             flags=re.IGNORECASE,
         )
@@ -163,7 +174,7 @@ class RepoCoderAgent:
             )
 
         chinese = re.search(
-            r"在\s*([A-Za-z0-9_./\\-]+\.py)\s*将`([^`]+)`替换为`([^`]+)`",
+            r"在\s*([A-Za-z0-9_./\-]+\.py)\s*将`([^`]+)`替换为`([^`]+)`",
             self.task.goal,
         )
         if chinese:

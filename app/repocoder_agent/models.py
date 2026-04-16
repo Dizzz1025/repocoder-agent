@@ -4,8 +4,18 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .config import DEFAULT_COMMANDS, DEFAULT_COMMAND_TIMEOUT_SEC
+
 
 PatchOperation = Literal["replace", "append", "create"]
+
+
+def _default_commands() -> list[str]:
+    return list(DEFAULT_COMMANDS)
+
+
+def _default_command_timeout_sec() -> int:
+    return DEFAULT_COMMAND_TIMEOUT_SEC
 
 
 class PatchInstruction(BaseModel):
@@ -70,7 +80,7 @@ class ScanResponse(BaseModel):
 class PlanRequest(BaseModel):
     repository_path: str
     goal: str
-    commands: list[str] = Field(default_factory=lambda: ["python -m pytest -q"])
+    commands: list[str] = Field(default_factory=_default_commands)
     top_k_files: int = Field(default=5, ge=1, le=30)
     patches: list[PatchInstruction] = Field(default_factory=list)
 
@@ -84,12 +94,12 @@ class PlanResponse(BaseModel):
 class AgentTaskRequest(BaseModel):
     repository_path: str
     goal: str
-    commands: list[str] = Field(default_factory=lambda: ["python -m pytest -q"])
+    commands: list[str] = Field(default_factory=_default_commands)
     patches: list[PatchInstruction] = Field(default_factory=list)
     max_iterations: int = Field(default=3, ge=1, le=10)
     top_k_files: int = Field(default=5, ge=1, le=30)
     auto_fix: bool = True
-    command_timeout_sec: int = Field(default=60, ge=1, le=600)
+    command_timeout_sec: int = Field(default_factory=_default_command_timeout_sec, ge=1, le=600)
 
 
 class AgentRunResponse(BaseModel):
