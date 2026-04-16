@@ -5,10 +5,11 @@ from dataclasses import dataclass
 
 from .autofix import ErrorAutoFixer
 from .executor import CommandExecutor
-from .models import AgentRunResponse, AgentTaskRequest, PatchInstruction
+from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
+from .models import AgentRunResponse, AgentTaskRequest, AppliedPatch, CommandResult, PatchInstruction
 from .patcher import PatchApplier
 from .planner import TaskPlanner
-from .repository import RepositoryScanner
+from .repository import RepoSnapshot, RepositoryScanner
 
 
 @dataclass
@@ -19,10 +20,11 @@ class _RunState:
 
 
 class RepoCoderAgent:
-    def __init__(self, task: AgentTaskRequest):
+    def __init__(self, task: AgentTaskRequest, llm_client: SupportsRepoCoderLLM | None = None):
         self.task = task
         self.scanner = RepositoryScanner(task.repository_path)
-        self.planner = TaskPlanner()
+        self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env()
+        self.planner = TaskPlanner(llm_client=self.llm_client)
         self.patcher = PatchApplier(task.repository_path)
         self.executor = CommandExecutor(task.repository_path, timeout_sec=task.command_timeout_sec)
         self.auto_fixer = ErrorAutoFixer(task.repository_path)
@@ -47,7 +49,7 @@ class RepoCoderAgent:
 
         initial_patches = list(self.task.patches)
         if not initial_patches:
-            inferred = self._infer_patch_from_goal(relevant_files)
+            inferred = self._infer_patch_from_goal(snapshot, relevant_files)
             if inferred is not None:
                 initial_patches.append(inferred)
 
@@ -74,7 +76,7 @@ class RepoCoderAgent:
                 state.message = "Commands failed and auto_fix is disabled."
                 break
 
-            suggestion = self.auto_fixer.suggest_fix(failed)
+            suggestion = self._suggest_retry_patch(failed, applied_patches)
             if suggestion is None:
                 state.message = "Commands failed and no auto-fix rule matched."
                 break
@@ -109,8 +111,44 @@ class RepoCoderAgent:
             message=state.message,
         )
 
-    def _infer_patch_from_goal(self, relevant_files) -> PatchInstruction | None:
-        # Pattern: in file.py replace `old` with `new`
+    def _suggest_retry_patch(
+        self,
+        failed: CommandResult,
+        applied_patches: list[AppliedPatch],
+    ) -> PatchInstruction | None:
+        if self.llm_client is not None:
+            current_snapshot = self.scanner.scan()
+            current_relevant_files = self.scanner.retrieve_relevant_files(
+                snapshot=current_snapshot,
+                goal=self.task.goal,
+                top_k=self.task.top_k_files,
+            )
+            llm_suggestion = self.llm_client.reflect_and_suggest_fix(
+                goal=self.task.goal,
+                command_result=failed,
+                snapshot=current_snapshot,
+                relevant_files=current_relevant_files,
+                applied_patch_summaries=[self._summarize_applied_patch(item) for item in applied_patches],
+            )
+            if llm_suggestion is not None and llm_suggestion.patch is not None:
+                return llm_suggestion.patch
+
+        return self.auto_fixer.suggest_fix(failed)
+
+    def _infer_patch_from_goal(
+        self,
+        snapshot: RepoSnapshot,
+        relevant_files,
+    ) -> PatchInstruction | None:
+        if self.llm_client is not None:
+            inferred = self.llm_client.generate_patch(
+                goal=self.task.goal,
+                snapshot=snapshot,
+                relevant_files=relevant_files,
+            )
+            if inferred is not None:
+                return inferred
+
         english = re.search(
             r"in\s+([A-Za-z0-9_./\\-]+\.py)\s+replace\s+`([^`]+)`\s+with\s+`([^`]+)`",
             self.task.goal,
@@ -124,7 +162,6 @@ class RepoCoderAgent:
                 replace_text=english.group(3),
             )
 
-        # Pattern: 在 xxx.py 将`旧`替换为`新`
         chinese = re.search(
             r"在\s*([A-Za-z0-9_./\\-]+\.py)\s*将`([^`]+)`替换为`([^`]+)`",
             self.task.goal,
@@ -146,6 +183,12 @@ class RepoCoderAgent:
                 replace_text=generic.group(2),
             )
         return None
+
+    def _summarize_applied_patch(self, patch: AppliedPatch) -> str:
+        return (
+            f"{patch.file_path} | {patch.operation} | success={patch.success} | "
+            f"message={patch.message}"
+        )
 
     @staticmethod
     def _patch_fingerprint(patch: PatchInstruction) -> str:

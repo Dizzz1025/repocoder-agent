@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
 from .models import PatchInstruction, RelevantFile
 
 
 class TaskPlanner:
+    def __init__(self, llm_client: SupportsRepoCoderLLM | None = None):
+        self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env()
+
     def build_plan(
         self,
         goal: str,
@@ -12,6 +16,17 @@ class TaskPlanner:
         patches: list[PatchInstruction],
         auto_fix: bool,
     ) -> list[str]:
+        if self.llm_client is not None:
+            llm_plan = self.llm_client.build_plan(
+                goal=goal,
+                relevant_files=relevant_files,
+                commands=commands,
+                patches=patches,
+                auto_fix=auto_fix,
+            )
+            if llm_plan:
+                return llm_plan
+
         steps = [
             f"Clarify goal and constraints: {goal}",
             "Scan repository and index Python-centric files.",
