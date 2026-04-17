@@ -9,6 +9,7 @@ from .executor import CommandExecutor
 from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
 from .memory.graph_builder import RepositoryGraphBuilder
 from .memory.graph_store import RepositoryGraphStore
+from .memory.history_store import RepositoryHistoryStore
 from .models import AgentRunResponse, AgentTaskRequest, AppliedPatch, CommandResult, PatchInstruction
 from .patcher import PatchApplier
 from .planner import TaskPlanner
@@ -36,6 +37,7 @@ class RepoCoderAgent:
         )
         self.graph_builder = RepositoryGraphBuilder()
         self.graph_store = RepositoryGraphStore(task.repository_path)
+        self.history_store = RepositoryHistoryStore(task.repository_path)
         self.hybrid_retriever = HybridRetriever()
         self.planner = TaskPlanner(llm_client=self.llm_client, start_dir=task.repository_path)
         self.patcher = PatchApplier(task.repository_path)
@@ -59,6 +61,11 @@ class RepoCoderAgent:
             goal=self.task.goal,
             graph=graph,
             top_k=self.task.top_k_files,
+            patch_success_counts=self.history_store.patch_success_counts(),
+            patch_failure_counts=self.history_store.patch_failure_counts(),
+            command_failure_counts=self.history_store.command_failure_counts(),
+            patch_history_events=self.history_store.patch_history_events(),
+            command_failure_events=self.history_store.command_failure_events(),
         )
         plan_steps = self.planner.build_plan(
             goal=self.task.goal,
@@ -70,6 +77,10 @@ class RepoCoderAgent:
 
         applied_patches: list[AppliedPatch] = []
         command_results = []
+        retrieval_trace = self._build_retrieval_trace(
+            graph=graph,
+            relevant_files=relevant_files,
+        )
         selection_trace: dict[str, list[dict] | dict] = {
             "initial": [],
             "retry": [],
@@ -107,7 +118,15 @@ class RepoCoderAgent:
             )
             sandbox_trace["initial"].append(self._serialize_sandbox_result(sandbox_result, approved_initial_patches))
             if sandbox_result.success:
-                applied_patches.extend(self.patcher.apply_many(approved_initial_patches))
+                patch_results = self.patcher.apply_many(approved_initial_patches)
+                applied_patches.extend(patch_results)
+                for patch_result in patch_results:
+                    self.history_store.record_patch_event(
+                        file_path=patch_result.file_path,
+                        operation=patch_result.operation,
+                        success=patch_result.success,
+                        message=patch_result.message,
+                    )
             else:
                 applied_patches.extend(self._sandbox_blocked_patch_results(approved_initial_patches, sandbox_result))
                 approved_initial_patches = []
@@ -123,6 +142,12 @@ class RepoCoderAgent:
             command_results.extend(current_results)
 
             failed = next((r for r in current_results if r.exit_code != 0), None)
+            if failed is not None:
+                self.history_store.record_command_failure(
+                    command=failed.command,
+                    stderr=failed.stderr,
+                    stdout=failed.stdout,
+                )
             if failed is None:
                 state.success = True
                 state.message = "All commands succeeded."
@@ -140,6 +165,9 @@ class RepoCoderAgent:
                 goal=self.task.goal,
                 graph=current_graph,
                 top_k=self.task.top_k_files,
+                patch_success_counts=self.history_store.patch_success_counts(),
+                patch_failure_counts=self.history_store.patch_failure_counts(),
+                command_failure_counts=self.history_store.command_failure_counts(),
             )
             retry_selection = self._select_retry_patch(
                 failed=failed,
@@ -175,6 +203,12 @@ class RepoCoderAgent:
 
             patch_result = self.patcher.apply(suggestion)
             applied_patches.append(patch_result)
+            self.history_store.record_patch_event(
+                file_path=patch_result.file_path,
+                operation=patch_result.operation,
+                success=patch_result.success,
+                message=patch_result.message,
+            )
             if not patch_result.success:
                 state.message = "Commands failed; auto-fix patch could not be applied."
                 break
@@ -203,6 +237,7 @@ class RepoCoderAgent:
             response=response,
             selection_trace=selection_trace,
             sandbox_trace=sandbox_trace,
+            retrieval_trace=retrieval_trace,
         )
         return response
 
@@ -385,6 +420,30 @@ class RepoCoderAgent:
                     f"{evaluation.patch.file_path}: uncertainty gate -> {evaluation.gate_decision.summary()}"
                 )
         return default if not details else default + " | " + " | ".join(details)
+
+    def _build_retrieval_trace(
+        self,
+        graph,
+        relevant_files,
+    ) -> dict:
+        return {
+            "graph_summary": graph.summary(),
+            "history_summary": {
+                "patch_success_counts": self.history_store.patch_success_counts(),
+                "patch_failure_counts": self.history_store.patch_failure_counts(),
+                "command_failure_counts": self.history_store.command_failure_counts(),
+                "patch_history_event_count": len(self.history_store.patch_history_events()),
+                "command_failure_event_count": len(self.history_store.command_failure_events()),
+            },
+            "relevant_files": [
+                {
+                    "file_path": item.file_path,
+                    "score": item.score,
+                    "reason": item.reason,
+                }
+                for item in relevant_files
+            ],
+        }
 
     def _serialize_selection_result(self, selection: PatchSelectionResult) -> dict:
         return {

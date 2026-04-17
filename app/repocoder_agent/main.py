@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from .agent import RepoCoderAgent
 from .memory.graph_builder import RepositoryGraphBuilder
 from .memory.graph_store import RepositoryGraphStore
+from .memory.history_store import RepositoryHistoryStore
 from .models import (
     AgentRunResponse,
     AgentTaskRequest,
@@ -54,11 +55,17 @@ def plan_task(request: PlanRequest) -> PlanResponse:
     graph = graph_builder.build_from_snapshot(snapshot)
     graph_store.save(graph)
     retriever = HybridRetriever()
+    history_store = RepositoryHistoryStore(request.repository_path)
     relevant_files = retriever.retrieve(
         snapshot=snapshot,
         goal=request.goal,
         graph=graph,
         top_k=request.top_k_files,
+        patch_success_counts=history_store.patch_success_counts(),
+        patch_failure_counts=history_store.patch_failure_counts(),
+        command_failure_counts=history_store.command_failure_counts(),
+        patch_history_events=history_store.patch_history_events(),
+        command_failure_events=history_store.command_failure_events(),
     )
     planner = TaskPlanner(start_dir=request.repository_path)
     plan_steps = planner.build_plan(

@@ -213,6 +213,8 @@ def test_agent_writes_trace_artifact(tmp_path: Path, monkeypatch) -> None:
     payload = json.loads(trace_files[0].read_text(encoding="utf-8"))
     assert payload["request"]["goal"] == task.goal
     assert payload["response"]["success"] is True
+    assert payload["retrieval_trace"]["graph_summary"]["files"] >= 1
+    assert payload["retrieval_trace"]["relevant_files"]
     assert payload["selection_trace"]["initial"]
     initial_trace = payload["selection_trace"]["initial"][0]
     assert initial_trace["selected_patch"]["file_path"] == "check.py"
