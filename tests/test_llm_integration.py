@@ -50,15 +50,19 @@ class MockLLMClient:
     ) -> LLMRetrySuggestion | None:
         self.reflect_calls += 1
         check_file = next(item for item in snapshot.files if item.rel_path == "check.py")
-        if '"almost_good"' not in check_file.content:
-            return None
+        if '"almost_good"' in check_file.content:
+            find_text = '"almost_good"'
+            reflection = "The first patch improved the value but did not satisfy the assertion."
+        else:
+            find_text = '"bad"'
+            reflection = "The initial candidate was rejected, so apply the correct fix directly."
         return LLMRetrySuggestion(
-            reflection="The first patch improved the value but did not satisfy the assertion.",
-            retry_prompt="Replace almost_good with good.",
+            reflection=reflection,
+            retry_prompt="Replace the incorrect value with good.",
             patch=PatchInstruction(
                 file_path="check.py",
                 operation="replace",
-                find_text='"almost_good"',
+                find_text=find_text,
                 replace_text='"good"',
             ),
         )
@@ -209,3 +213,7 @@ def test_agent_writes_trace_artifact(tmp_path: Path, monkeypatch) -> None:
     payload = json.loads(trace_files[0].read_text(encoding="utf-8"))
     assert payload["request"]["goal"] == task.goal
     assert payload["response"]["success"] is True
+    assert payload["selection_trace"]["initial"]
+    initial_trace = payload["selection_trace"]["initial"][0]
+    assert initial_trace["selected_patch"]["file_path"] == "check.py"
+    assert initial_trace["evaluations"]

@@ -12,6 +12,8 @@ from .patcher import PatchApplier
 from .planner import TaskPlanner
 from .policies.uncertainty_gate import UncertaintyDecision, UncertaintyGate
 from .repository import RepoSnapshot, RepositoryScanner
+from .sandbox import DryRunResult, DryRunSandbox
+from .selectors.patch_selector import PatchSelectionResult, PatchSelector
 from .tracing import RunTraceWriter
 
 
@@ -36,6 +38,11 @@ class RepoCoderAgent:
         self.trace_writer = RunTraceWriter(task.repository_path)
         self.uncertainty_gate = UncertaintyGate(llm_client=self.llm_client)
         self.patch_critic = PatchCritic(llm_client=self.llm_client)
+        self.patch_selector = PatchSelector(
+            uncertainty_gate=self.uncertainty_gate,
+            patch_critic=self.patch_critic,
+        )
+        self.dry_run_sandbox = DryRunSandbox(task.repository_path, timeout_sec=task.command_timeout_sec)
 
     def run(self) -> AgentRunResponse:
         snapshot = self.scanner.scan()
@@ -54,28 +61,47 @@ class RepoCoderAgent:
 
         applied_patches: list[AppliedPatch] = []
         command_results = []
-
-        initial_patches = list(self.task.patches)
-        if not initial_patches:
-            inferred = self._infer_patch_from_goal(snapshot, relevant_files)
-            if inferred is not None:
-                initial_patches.append(inferred)
+        selection_trace: dict[str, list[dict] | dict] = {
+            "initial": [],
+            "retry": [],
+        }
+        sandbox_trace: dict[str, list[dict] | dict] = {
+            "initial": [],
+            "retry": [],
+        }
 
         approved_initial_patches: list[PatchInstruction] = []
-        for patch in initial_patches:
-            approved, blocked_result = self._approve_patch_candidate(
-                patch=patch,
-                relevant_files=relevant_files,
+        if self.task.patches:
+            for patch in self.task.patches:
+                approved, blocked_result = self._approve_patch_candidate(
+                    patch=patch,
+                    relevant_files=relevant_files,
+                    snapshot=snapshot,
+                    phase="initial",
+                )
+                if approved:
+                    approved_initial_patches.append(patch)
+                elif blocked_result is not None:
+                    applied_patches.append(blocked_result)
+        else:
+            initial_selection = self._select_initial_patch(
                 snapshot=snapshot,
-                phase="initial",
+                relevant_files=relevant_files,
             )
-            if approved:
-                approved_initial_patches.append(patch)
-            elif blocked_result is not None:
-                applied_patches.append(blocked_result)
+            selection_trace["initial"].append(self._serialize_selection_result(initial_selection))
+            approved_initial_patches.extend(self._selection_to_patches(initial_selection, applied_patches))
 
         if approved_initial_patches:
-            applied_patches.extend(self.patcher.apply_many(approved_initial_patches))
+            sandbox_result = self.dry_run_sandbox.validate_patches(
+                patches=approved_initial_patches,
+                commands=self.task.commands,
+            )
+            sandbox_trace["initial"].append(self._serialize_sandbox_result(sandbox_result, approved_initial_patches))
+            if sandbox_result.success:
+                applied_patches.extend(self.patcher.apply_many(approved_initial_patches))
+            else:
+                applied_patches.extend(self._sandbox_blocked_patch_results(approved_initial_patches, sandbox_result))
+                approved_initial_patches = []
 
         state = _RunState()
         seen_patch_fingerprints: set[str] = set()
@@ -103,33 +129,35 @@ class RepoCoderAgent:
                 goal=self.task.goal,
                 top_k=self.task.top_k_files,
             )
-            suggestion = self._suggest_retry_patch(
+            retry_selection = self._select_retry_patch(
                 failed=failed,
                 applied_patches=applied_patches,
                 current_snapshot=current_snapshot,
                 current_relevant_files=current_relevant_files,
             )
-            if suggestion is None:
-                state.message = "Commands failed and no auto-fix rule matched."
+            selection_trace["retry"].append(self._serialize_selection_result(retry_selection))
+            approved_retry_patches = self._selection_to_patches(retry_selection, applied_patches)
+            if not approved_retry_patches:
+                state.message = self._selection_failure_message(
+                    retry_selection,
+                    default="Commands failed and no auto-fix rule matched.",
+                )
                 break
 
-            approved, blocked_result = self._approve_patch_candidate(
-                patch=suggestion,
-                relevant_files=current_relevant_files,
-                snapshot=current_snapshot,
-                phase="retry",
+            sandbox_result = self.dry_run_sandbox.validate_patches(
+                patches=approved_retry_patches,
+                commands=self.task.commands,
             )
-            if not approved:
-                if blocked_result is not None:
-                    applied_patches.append(blocked_result)
-                    state.message = blocked_result.message
-                else:
-                    state.message = "Commands failed; patch approval pipeline rejected the retry patch."
+            sandbox_trace["retry"].append(self._serialize_sandbox_result(sandbox_result, approved_retry_patches))
+            if not sandbox_result.success:
+                applied_patches.extend(self._sandbox_blocked_patch_results(approved_retry_patches, sandbox_result))
+                state.message = sandbox_result.message
                 break
 
+            suggestion = approved_retry_patches[0]
             fingerprint = self._patch_fingerprint(suggestion)
             if fingerprint in seen_patch_fingerprints:
-                state.message = "Commands failed; auto-fix produced a repeated patch."
+                state.message = "Commands failed; patch selection produced a repeated patch."
                 break
             seen_patch_fingerprints.add(fingerprint)
 
@@ -161,6 +189,8 @@ class RepoCoderAgent:
             summary=snapshot.summary,
             relevant_files=relevant_files,
             response=response,
+            selection_trace=selection_trace,
+            sandbox_trace=sandbox_trace,
         )
         return response
 
@@ -198,14 +228,96 @@ class RepoCoderAgent:
 
         return True, None
 
-    def _suggest_retry_patch(
+    def _select_initial_patch(
+        self,
+        snapshot: RepoSnapshot,
+        relevant_files,
+    ) -> PatchSelectionResult:
+        candidates = self._collect_initial_patch_candidates(snapshot, relevant_files)
+        return self.patch_selector.select(
+            candidates=candidates,
+            relevant_files=relevant_files,
+            snapshot=snapshot,
+            goal=self.task.goal,
+            phase="initial",
+        )
+
+    def _select_retry_patch(
         self,
         failed: CommandResult,
         applied_patches: list[AppliedPatch],
         current_snapshot: RepoSnapshot,
         current_relevant_files,
-    ) -> PatchInstruction | None:
-        if self.llm_client is not None:
+    ) -> PatchSelectionResult:
+        candidates = self._collect_retry_patch_candidates(
+            failed=failed,
+            applied_patches=applied_patches,
+            current_snapshot=current_snapshot,
+            current_relevant_files=current_relevant_files,
+        )
+        return self.patch_selector.select(
+            candidates=candidates,
+            relevant_files=current_relevant_files,
+            snapshot=current_snapshot,
+            goal=self.task.goal,
+            phase="retry",
+        )
+
+    def _collect_initial_patch_candidates(
+        self,
+        snapshot: RepoSnapshot,
+        relevant_files,
+    ) -> list[tuple[str, PatchInstruction]]:
+        candidates: list[tuple[str, PatchInstruction]] = []
+
+        generator = getattr(self.llm_client, "generate_patch_candidates", None) if self.llm_client else None
+        if callable(generator):
+            for patch in generator(
+                goal=self.task.goal,
+                snapshot=snapshot,
+                relevant_files=relevant_files,
+                max_candidates=3,
+            ):
+                candidates.append(("llm-candidate", patch))
+        elif self.llm_client is not None:
+            inferred = self.llm_client.generate_patch(
+                goal=self.task.goal,
+                snapshot=snapshot,
+                relevant_files=relevant_files,
+            )
+            if inferred is not None:
+                candidates.append(("llm", inferred))
+
+        rule_candidate = self._infer_patch_from_goal_rules(relevant_files)
+        if rule_candidate is not None:
+            candidates.append(("rule", rule_candidate))
+        return candidates
+
+    def _collect_retry_patch_candidates(
+        self,
+        failed: CommandResult,
+        applied_patches: list[AppliedPatch],
+        current_snapshot: RepoSnapshot,
+        current_relevant_files,
+    ) -> list[tuple[str, PatchInstruction]]:
+        candidates: list[tuple[str, PatchInstruction]] = []
+
+        generator = (
+            getattr(self.llm_client, "reflect_and_suggest_fix_candidates", None)
+            if self.llm_client is not None
+            else None
+        )
+        if callable(generator):
+            for patch in generator(
+                goal=self.task.goal,
+                command_result=failed,
+                snapshot=current_snapshot,
+                relevant_files=current_relevant_files,
+                applied_patch_summaries=[self._summarize_applied_patch(item) for item in applied_patches],
+                max_candidates=3,
+            ):
+                candidates.append(("llm-candidate", patch))
+        elif self.llm_client is not None:
             llm_suggestion = self.llm_client.reflect_and_suggest_fix(
                 goal=self.task.goal,
                 command_result=failed,
@@ -214,24 +326,101 @@ class RepoCoderAgent:
                 applied_patch_summaries=[self._summarize_applied_patch(item) for item in applied_patches],
             )
             if llm_suggestion is not None and llm_suggestion.patch is not None:
-                return llm_suggestion.patch
+                candidates.append(("llm", llm_suggestion.patch))
 
-        return self.auto_fixer.suggest_fix(failed)
+        rule_patch = self.auto_fixer.suggest_fix(failed)
+        if rule_patch is not None:
+            candidates.append(("rule-autofix", rule_patch))
+        return candidates
 
-    def _infer_patch_from_goal(
+    def _selection_to_patches(
         self,
-        snapshot: RepoSnapshot,
-        relevant_files,
-    ) -> PatchInstruction | None:
-        if self.llm_client is not None:
-            inferred = self.llm_client.generate_patch(
-                goal=self.task.goal,
-                snapshot=snapshot,
-                relevant_files=relevant_files,
-            )
-            if inferred is not None:
-                return inferred
+        selection: PatchSelectionResult,
+        applied_patches: list[AppliedPatch],
+    ) -> list[PatchInstruction]:
+        if selection.selected_patch is not None:
+            return [selection.selected_patch]
 
+        for evaluation in selection.evaluations:
+            if evaluation.critique is not None:
+                applied_patches.append(self._critic_blocked_patch_result(evaluation.patch, evaluation.critique))
+            else:
+                applied_patches.append(
+                    self._blocked_patch_result(
+                        patch=evaluation.patch,
+                        source="uncertainty gate",
+                        action=evaluation.gate_decision.action,
+                        summary=evaluation.gate_decision.summary(),
+                    )
+                )
+        return []
+
+    def _selection_failure_message(
+        self,
+        selection: PatchSelectionResult,
+        default: str,
+    ) -> str:
+        if selection.selected_patch is not None:
+            return default
+        if not selection.evaluations:
+            return default
+        details = []
+        for evaluation in selection.evaluations:
+            if evaluation.critique is not None:
+                details.append(f"{evaluation.patch.file_path}: patch critic -> {evaluation.critique.summary()}")
+            else:
+                details.append(
+                    f"{evaluation.patch.file_path}: uncertainty gate -> {evaluation.gate_decision.summary()}"
+                )
+        return default if not details else default + " | " + " | ".join(details)
+
+    def _serialize_selection_result(self, selection: PatchSelectionResult) -> dict:
+        return {
+            "selected_source": selection.selected_source,
+            "selected_patch": (
+                selection.selected_patch.model_dump(mode="json", exclude_none=True)
+                if selection.selected_patch is not None
+                else None
+            ),
+            "selected_score": selection.selected_score(),
+            "evaluations": [
+                {
+                    "source": evaluation.source,
+                    "patch": evaluation.patch.model_dump(mode="json", exclude_none=True),
+                    "gate": {
+                        "action": evaluation.gate_decision.action,
+                        "reasons": list(evaluation.gate_decision.reasons),
+                    },
+                    "critic": (
+                        {
+                            "action": evaluation.critique.action,
+                            "reasons": list(evaluation.critique.reasons),
+                            "score": evaluation.critique.score,
+                        }
+                        if evaluation.critique is not None
+                        else None
+                    ),
+                    "score": evaluation.score,
+                    "score_breakdown": evaluation.score_breakdown or {},
+                }
+                for evaluation in selection.evaluations
+            ],
+        }
+
+    def _serialize_sandbox_result(
+        self,
+        result: DryRunResult,
+        patches: list[PatchInstruction],
+    ) -> dict:
+        return {
+            "success": result.success,
+            "message": result.message,
+            "patches": [patch.model_dump(mode="json", exclude_none=True) for patch in patches],
+            "patch_results": [item.model_dump(mode="json") for item in result.patch_results],
+            "command_results": [item.model_dump(mode="json") for item in result.command_results],
+        }
+
+    def _infer_patch_from_goal_rules(self, relevant_files) -> PatchInstruction | None:
         english = re.search(
             r"in\s+([A-Za-z0-9_./\-]+\.py)\s+replace\s+`([^`]+)`\s+with\s+`([^`]+)`",
             self.task.goal,
@@ -292,6 +481,21 @@ class RepoCoderAgent:
             action=critique.action,
             summary=critique.summary(),
         )
+
+    def _sandbox_blocked_patch_results(
+        self,
+        patches: list[PatchInstruction],
+        sandbox_result: DryRunResult,
+    ) -> list[AppliedPatch]:
+        return [
+            AppliedPatch(
+                file_path=patch.file_path,
+                operation=patch.operation,
+                success=False,
+                message=f"Patch blocked by dry-run sandbox: {sandbox_result.message}",
+            )
+            for patch in patches
+        ]
 
     def _summarize_applied_patch(self, patch: AppliedPatch) -> str:
         return (

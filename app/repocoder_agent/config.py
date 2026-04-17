@@ -10,6 +10,7 @@ DEFAULT_COMMANDS = ["python -m pytest -q"]
 DEFAULT_COMMAND_TIMEOUT_SEC = 60
 DEFAULT_TRACE_ENABLED = True
 DEFAULT_TRACE_DIRNAME = ".repocoder/runs"
+DEFAULT_DRY_RUN_ENABLED = True
 
 _ENV_LOADED = False
 _LOADED_ENV_KEYS: set[str] = set()
@@ -24,6 +25,7 @@ class Settings:
     default_command_timeout_sec: int
     trace_enabled: bool
     trace_dirname: str
+    dry_run_enabled: bool
 
 
 def load_environment(start_dir: str | Path | None = None) -> None:
@@ -50,6 +52,7 @@ def get_settings(start_dir: str | Path | None = None) -> Settings:
         default_command_timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         trace_enabled=_parse_bool(os.getenv("REPOCODER_TRACE_ENABLED"), DEFAULT_TRACE_ENABLED),
         trace_dirname=os.getenv("REPOCODER_TRACE_DIR", DEFAULT_TRACE_DIRNAME),
+        dry_run_enabled=_parse_bool(os.getenv("REPOCODER_DRY_RUN_ENABLED"), DEFAULT_DRY_RUN_ENABLED),
     )
 
 

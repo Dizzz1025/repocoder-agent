@@ -20,6 +20,8 @@ class RunTraceWriter:
         summary: RepositorySummary,
         relevant_files: list[RelevantFile],
         response: AgentRunResponse,
+        selection_trace: dict | None = None,
+        sandbox_trace: dict | None = None,
     ) -> Path | None:
         if not self.settings.trace_enabled:
             return None
@@ -36,6 +38,8 @@ class RunTraceWriter:
                 "request": request.model_dump(mode="json"),
                 "summary": summary.model_dump(mode="json"),
                 "relevant_files": [item.model_dump(mode="json") for item in relevant_files],
+                "selection_trace": selection_trace or {},
+                "sandbox_trace": sandbox_trace or {},
                 "response": response.model_dump(mode="json"),
             }
             trace_path.write_text(

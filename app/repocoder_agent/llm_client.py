@@ -53,6 +53,14 @@ class SupportsRepoCoderLLM(Protocol):
         relevant_files: list[RelevantFile],
     ) -> PatchInstruction | None: ...
 
+    def generate_patch_candidates(
+        self,
+        goal: str,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        max_candidates: int = 3,
+    ) -> list[PatchInstruction]: ...
+
     def reflect_and_suggest_fix(
         self,
         goal: str,
@@ -61,6 +69,16 @@ class SupportsRepoCoderLLM(Protocol):
         relevant_files: list[RelevantFile],
         applied_patch_summaries: list[str],
     ) -> LLMRetrySuggestion | None: ...
+
+    def reflect_and_suggest_fix_candidates(
+        self,
+        goal: str,
+        command_result: CommandResult,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        applied_patch_summaries: list[str],
+        max_candidates: int = 3,
+    ) -> list[PatchInstruction]: ...
 
     def review_patch_uncertainty(
         self,
@@ -152,29 +170,44 @@ class OpenAICompatibleLLMClient:
         snapshot: RepoSnapshot,
         relevant_files: list[RelevantFile],
     ) -> PatchInstruction | None:
+        candidates = self.generate_patch_candidates(
+            goal=goal,
+            snapshot=snapshot,
+            relevant_files=relevant_files,
+            max_candidates=1,
+        )
+        return candidates[0] if candidates else None
+
+    def generate_patch_candidates(
+        self,
+        goal: str,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        max_candidates: int = 3,
+    ) -> list[PatchInstruction]:
         payload = self._request_json(
             system_prompt=(
-                "You generate one minimal patch instruction for RepoCoder-Agent. "
+                "You generate patch candidates for RepoCoder-Agent. "
                 "Return strict JSON only."
             ),
             user_prompt=(
-                "Generate one safe patch instruction for this coding task.\n"
+                "Generate up to three candidate patch instructions for this coding task.\n"
                 f"Goal: {goal}\n"
                 f"Repository summary: indexed_files={snapshot.summary.indexed_count}\n"
                 f"Relevant files: {self._serialize_relevant_files(relevant_files)}\n\n"
                 f"File context:\n{self._serialize_file_context(snapshot, relevant_files)}\n\n"
                 "Return JSON with this schema only:\n"
-                '{"patch": {"file_path": "path.py", "operation": "replace", '
-                '"find_text": "old", "replace_text": "new"}}\n'
-                'If there is no safe minimal patch, return {"patch": null}.\n'
+                '{"patches": [{"file_path": "path.py", "operation": "replace", '
+                '"find_text": "old", "replace_text": "new"}]}\n'
                 "Rules:\n"
+                f"- Return at most {max_candidates} patch candidates.\n"
                 "- file_path must be relative to the repository root.\n"
-                "- Prefer one replace patch when possible.\n"
+                "- Prefer precise replace patches when possible.\n"
                 "- find_text must exactly match provided file content.\n"
                 "- Do not use markdown."
             ),
         )
-        return self._parse_patch_from_payload(payload)
+        return self._parse_patch_list_from_payload(payload)
 
     def reflect_and_suggest_fix(
         self,
@@ -184,14 +217,39 @@ class OpenAICompatibleLLMClient:
         relevant_files: list[RelevantFile],
         applied_patch_summaries: list[str],
     ) -> LLMRetrySuggestion | None:
+        candidates = self.reflect_and_suggest_fix_candidates(
+            goal=goal,
+            command_result=command_result,
+            snapshot=snapshot,
+            relevant_files=relevant_files,
+            applied_patch_summaries=applied_patch_summaries,
+            max_candidates=1,
+        )
+        patch = candidates[0] if candidates else None
+        if patch is None:
+            return None
+        return LLMRetrySuggestion(
+            reflection="LLM generated a retry patch candidate.",
+            retry_prompt="Retry with the selected patch candidate.",
+            patch=patch,
+        )
+
+    def reflect_and_suggest_fix_candidates(
+        self,
+        goal: str,
+        command_result: CommandResult,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        applied_patch_summaries: list[str],
+        max_candidates: int = 3,
+    ) -> list[PatchInstruction]:
         payload = self._request_json(
             system_prompt=(
-                "You are the retry and reflection module for RepoCoder-Agent. "
+                "You generate retry patch candidates for RepoCoder-Agent. "
                 "Return strict JSON only."
             ),
             user_prompt=(
-                "The validation command failed. Reflect on the failure and suggest one "
-                "minimal retry patch if possible.\n"
+                "The validation command failed. Generate up to three retry patch candidates.\n"
                 f"Goal: {goal}\n"
                 f"Failed command: {command_result.command}\n"
                 f"Exit code: {command_result.exit_code}\n"
@@ -202,26 +260,15 @@ class OpenAICompatibleLLMClient:
                 f"Relevant files: {self._serialize_relevant_files(relevant_files)}\n\n"
                 f"Current file context:\n{self._serialize_file_context(snapshot, relevant_files)}\n\n"
                 "Return JSON with this schema only:\n"
-                '{"reflection": "short analysis", "retry_prompt": "next attempt guidance", '
-                '"patch": {"file_path": "path.py", "operation": "replace", '
-                '"find_text": "old", "replace_text": "new"}}\n'
-                'If you cannot produce a safe patch, return "patch": null.\n'
-                "Do not use markdown."
+                '{"patches": [{"file_path": "path.py", "operation": "replace", '
+                '"find_text": "old", "replace_text": "new"}]}\n'
+                "Rules:\n"
+                f"- Return at most {max_candidates} patch candidates.\n"
+                "- Prefer minimal fixes that directly address the observed failure.\n"
+                "- Do not use markdown."
             ),
         )
-        if not isinstance(payload, dict):
-            return None
-
-        patch = self._parse_patch_from_payload(payload)
-        reflection = str(payload.get("reflection", "")).strip()
-        retry_prompt = str(payload.get("retry_prompt", "")).strip()
-        if not reflection and not retry_prompt and patch is None:
-            return None
-        return LLMRetrySuggestion(
-            reflection=reflection,
-            retry_prompt=retry_prompt,
-            patch=patch,
-        )
+        return self._parse_patch_list_from_payload(payload)
 
     def review_patch_uncertainty(
         self,
@@ -364,6 +411,22 @@ class OpenAICompatibleLLMClient:
             return PatchInstruction.model_validate(patch_data)
         except Exception:
             return None
+
+    def _parse_patch_list_from_payload(self, payload: dict[str, Any] | None) -> list[PatchInstruction]:
+        if not isinstance(payload, dict):
+            return []
+        patches_raw = payload.get("patches")
+        if not isinstance(patches_raw, list):
+            return []
+        patches: list[PatchInstruction] = []
+        for item in patches_raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                patches.append(PatchInstruction.model_validate(item))
+            except Exception:
+                continue
+        return patches
 
     def _serialize_relevant_files(self, relevant_files: list[RelevantFile]) -> list[dict[str, Any]]:
         return [
