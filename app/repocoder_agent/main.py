@@ -3,6 +3,8 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .agent import RepoCoderAgent
+from .memory.graph_builder import RepositoryGraphBuilder
+from .memory.graph_store import RepositoryGraphStore
 from .models import (
     AgentRunResponse,
     AgentTaskRequest,
@@ -13,6 +15,7 @@ from .models import (
 )
 from .planner import TaskPlanner
 from .repository import RepositoryScanner
+from .retrieval.hybrid_retriever import HybridRetriever
 
 app = FastAPI(
     title="RepoCoder-Agent MVP",
@@ -46,9 +49,15 @@ def plan_task(request: PlanRequest) -> PlanResponse:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    relevant_files = scanner.retrieve_relevant_files(
+    graph_builder = RepositoryGraphBuilder()
+    graph_store = RepositoryGraphStore(request.repository_path)
+    graph = graph_builder.build_from_snapshot(snapshot)
+    graph_store.save(graph)
+    retriever = HybridRetriever()
+    relevant_files = retriever.retrieve(
         snapshot=snapshot,
         goal=request.goal,
+        graph=graph,
         top_k=request.top_k_files,
     )
     planner = TaskPlanner(start_dir=request.repository_path)

@@ -7,11 +7,14 @@ from .autofix import ErrorAutoFixer
 from .critics.patch_critic import PatchCritic, PatchCritique
 from .executor import CommandExecutor
 from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
+from .memory.graph_builder import RepositoryGraphBuilder
+from .memory.graph_store import RepositoryGraphStore
 from .models import AgentRunResponse, AgentTaskRequest, AppliedPatch, CommandResult, PatchInstruction
 from .patcher import PatchApplier
 from .planner import TaskPlanner
 from .policies.uncertainty_gate import UncertaintyDecision, UncertaintyGate
 from .repository import RepoSnapshot, RepositoryScanner
+from .retrieval.hybrid_retriever import HybridRetriever
 from .sandbox import DryRunResult, DryRunSandbox
 from .selectors.patch_selector import PatchSelectionResult, PatchSelector
 from .tracing import RunTraceWriter
@@ -31,6 +34,9 @@ class RepoCoderAgent:
         self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env(
             start_dir=task.repository_path
         )
+        self.graph_builder = RepositoryGraphBuilder()
+        self.graph_store = RepositoryGraphStore(task.repository_path)
+        self.hybrid_retriever = HybridRetriever()
         self.planner = TaskPlanner(llm_client=self.llm_client, start_dir=task.repository_path)
         self.patcher = PatchApplier(task.repository_path)
         self.executor = CommandExecutor(task.repository_path, timeout_sec=task.command_timeout_sec)
@@ -46,9 +52,12 @@ class RepoCoderAgent:
 
     def run(self) -> AgentRunResponse:
         snapshot = self.scanner.scan()
-        relevant_files = self.scanner.retrieve_relevant_files(
+        graph = self.graph_builder.build_from_snapshot(snapshot)
+        self.graph_store.save(graph)
+        relevant_files = self.hybrid_retriever.retrieve(
             snapshot=snapshot,
             goal=self.task.goal,
+            graph=graph,
             top_k=self.task.top_k_files,
         )
         plan_steps = self.planner.build_plan(
@@ -124,9 +133,12 @@ class RepoCoderAgent:
                 break
 
             current_snapshot = self.scanner.scan()
-            current_relevant_files = self.scanner.retrieve_relevant_files(
+            current_graph = self.graph_builder.build_from_snapshot(current_snapshot)
+            self.graph_store.save(current_graph)
+            current_relevant_files = self.hybrid_retriever.retrieve(
                 snapshot=current_snapshot,
                 goal=self.task.goal,
+                graph=current_graph,
                 top_k=self.task.top_k_files,
             )
             retry_selection = self._select_retry_patch(

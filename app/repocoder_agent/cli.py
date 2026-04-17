@@ -7,9 +7,12 @@ from typing import Sequence
 import uvicorn
 
 from .agent import RepoCoderAgent
+from .memory.graph_builder import RepositoryGraphBuilder
+from .memory.graph_store import RepositoryGraphStore
 from .models import AgentTaskRequest, PlanRequest, ScanRequest
 from .planner import TaskPlanner
 from .repository import RepositoryScanner
+from .retrieval.hybrid_retriever import HybridRetriever
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -105,9 +108,15 @@ def _scan_repository(request: ScanRequest):
 def _plan_task(request: PlanRequest):
     scanner = RepositoryScanner(request.repository_path)
     snapshot = scanner.scan()
-    relevant_files = scanner.retrieve_relevant_files(
+    graph_builder = RepositoryGraphBuilder()
+    graph_store = RepositoryGraphStore(request.repository_path)
+    graph = graph_builder.build_from_snapshot(snapshot)
+    graph_store.save(graph)
+    retriever = HybridRetriever()
+    relevant_files = retriever.retrieve(
         snapshot=snapshot,
         goal=request.goal,
+        graph=graph,
         top_k=request.top_k_files,
     )
     planner = TaskPlanner(start_dir=request.repository_path)
