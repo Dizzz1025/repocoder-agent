@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from .autofix import ErrorAutoFixer
 from .critics.patch_critic import PatchCritic, PatchCritique
 from .executor import CommandExecutor
+from .hooks.manager import HookManager
 from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
 from .memory.graph_builder import RepositoryGraphBuilder
 from .memory.graph_store import RepositoryGraphStore
@@ -44,6 +45,7 @@ class RepoCoderAgent:
         self.executor = CommandExecutor(task.repository_path, timeout_sec=task.command_timeout_sec)
         self.auto_fixer = ErrorAutoFixer(task.repository_path)
         self.trace_writer = RunTraceWriter(task.repository_path)
+        self.hook_manager = HookManager(task.repository_path)
         self.uncertainty_gate = UncertaintyGate(llm_client=self.llm_client)
         self.patch_critic = PatchCritic(llm_client=self.llm_client)
         self.patch_selector = PatchSelector(
@@ -87,6 +89,13 @@ class RepoCoderAgent:
             "initial": [],
             "retry": [],
         }
+        hooks_trace: dict[str, list[dict]] = {
+            "pre_patch": [],
+            "post_patch": [],
+            "pre_command": [],
+            "post_command": [],
+            "run_stop": [],
+        }
         sandbox_trace: dict[str, list[dict] | dict] = {
             "initial": [],
             "retry": [],
@@ -113,6 +122,58 @@ class RepoCoderAgent:
             selection_trace["initial"].append(self._serialize_selection_result(initial_selection))
             approved_initial_patches.extend(self._selection_to_patches(initial_selection, applied_patches))
 
+        if self.task.mode == "plan":
+            plan_message = (
+                "Plan mode completed without applying changes."
+                if approved_initial_patches
+                else "Plan mode completed without any approved patch candidates."
+            )
+            self._run_hooks(
+                event="run_stop",
+                hooks_trace=hooks_trace,
+                contexts=[{"message": plan_message}],
+            )
+            response = AgentRunResponse(
+                success=True,
+                summary=snapshot.summary,
+                relevant_files=relevant_files,
+                plan_steps=plan_steps,
+                applied_patches=applied_patches,
+                command_results=[],
+                iterations_used=0,
+                message=plan_message,
+                mode=self.task.mode,
+                proposed_patches=approved_initial_patches,
+            )
+            self.trace_writer.write_run(
+                request=self.task,
+                summary=snapshot.summary,
+                relevant_files=relevant_files,
+                response=response,
+                selection_trace=selection_trace,
+                sandbox_trace=sandbox_trace,
+                retrieval_trace=retrieval_trace,
+                hooks_trace=hooks_trace,
+            )
+            return response
+
+        if approved_initial_patches:
+            pre_patch_results = self._run_hooks(
+                event="pre_patch",
+                hooks_trace=hooks_trace,
+                contexts=[
+                    {
+                        "file_path": patch.file_path,
+                        "operation": patch.operation,
+                        "message": "initial patch candidate",
+                    }
+                    for patch in approved_initial_patches
+                ],
+            )
+            if self._hooks_blocked(pre_patch_results):
+                applied_patches.extend(self._hook_blocked_patch_results(approved_initial_patches, pre_patch_results))
+                approved_initial_patches = []
+
         if approved_initial_patches:
             sandbox_result = self.dry_run_sandbox.validate_patches(
                 patches=approved_initial_patches,
@@ -122,6 +183,18 @@ class RepoCoderAgent:
             if sandbox_result.success:
                 patch_results = self.patcher.apply_many(approved_initial_patches)
                 applied_patches.extend(patch_results)
+                self._run_hooks(
+                    event="post_patch",
+                    hooks_trace=hooks_trace,
+                    contexts=[
+                        {
+                            "file_path": patch_result.file_path,
+                            "operation": patch_result.operation,
+                            "message": patch_result.message,
+                        }
+                        for patch_result in patch_results
+                    ],
+                )
                 for patch_result in patch_results:
                     self.history_store.record_patch_event(
                         file_path=patch_result.file_path,
@@ -140,7 +213,29 @@ class RepoCoderAgent:
 
         for iteration in range(1, self.task.max_iterations + 1):
             state.iterations_used = iteration
+            pre_command_results = self._run_hooks(
+                event="pre_command",
+                hooks_trace=hooks_trace,
+                contexts=[
+                    {"command": command, "message": "about to execute command"}
+                    for command in self.task.commands
+                ],
+            )
+            if self._hooks_blocked(pre_command_results):
+                state.message = "Command execution blocked by hooks."
+                break
             current_results = self.executor.run_many(self.task.commands)
+            self._run_hooks(
+                event="post_command",
+                hooks_trace=hooks_trace,
+                contexts=[
+                    {
+                        "command": result.command,
+                        "message": result.stderr or result.stdout,
+                    }
+                    for result in current_results
+                ],
+            )
             command_results.extend(current_results)
 
             failed = next((r for r in current_results if r.exit_code != 0), None)
@@ -196,6 +291,23 @@ class RepoCoderAgent:
                 )
                 break
 
+            pre_patch_results = self._run_hooks(
+                event="pre_patch",
+                hooks_trace=hooks_trace,
+                contexts=[
+                    {
+                        "file_path": patch.file_path,
+                        "operation": patch.operation,
+                        "message": "retry patch candidate",
+                    }
+                    for patch in approved_retry_patches
+                ],
+            )
+            if self._hooks_blocked(pre_patch_results):
+                applied_patches.extend(self._hook_blocked_patch_results(approved_retry_patches, pre_patch_results))
+                state.message = "Retry patch blocked by hooks."
+                break
+
             sandbox_result = self.dry_run_sandbox.validate_patches(
                 patches=approved_retry_patches,
                 commands=self.task.commands,
@@ -215,6 +327,17 @@ class RepoCoderAgent:
 
             patch_result = self.patcher.apply(suggestion)
             applied_patches.append(patch_result)
+            self._run_hooks(
+                event="post_patch",
+                hooks_trace=hooks_trace,
+                contexts=[
+                    {
+                        "file_path": patch_result.file_path,
+                        "operation": patch_result.operation,
+                        "message": patch_result.message,
+                    }
+                ],
+            )
             self.history_store.record_patch_event(
                 file_path=patch_result.file_path,
                 operation=patch_result.operation,
@@ -241,6 +364,8 @@ class RepoCoderAgent:
             command_results=command_results,
             iterations_used=state.iterations_used,
             message=state.message,
+            mode=self.task.mode,
+            proposed_patches=[],
         )
         self.trace_writer.write_run(
             request=self.task,
@@ -250,6 +375,7 @@ class RepoCoderAgent:
             selection_trace=selection_trace,
             sandbox_trace=sandbox_trace,
             retrieval_trace=retrieval_trace,
+            hooks_trace=hooks_trace,
         )
         return response
 
@@ -432,6 +558,46 @@ class RepoCoderAgent:
                     f"{evaluation.patch.file_path}: uncertainty gate -> {evaluation.gate_decision.summary()}"
                 )
         return default if not details else default + " | " + " | ".join(details)
+
+    def _run_hooks(
+        self,
+        event: str,
+        hooks_trace: dict[str, list[dict]],
+        contexts: list[dict],
+    ) -> list[dict]:
+        results: list[dict] = []
+        for context in contexts:
+            for result in self.hook_manager.handle(event, context):
+                entry = {
+                    "event": result.event,
+                    "action": result.action,
+                    "message": result.message,
+                    "matched_rule": result.matched_rule,
+                    "blocked": result.blocked,
+                    "context": context,
+                }
+                hooks_trace.setdefault(event, []).append(entry)
+                results.append(entry)
+        return results
+
+    def _hooks_blocked(self, results: list[dict]) -> bool:
+        return any(bool(item.get("blocked")) for item in results)
+
+    def _hook_blocked_patch_results(
+        self,
+        patches: list[PatchInstruction],
+        hook_results: list[dict],
+    ) -> list[AppliedPatch]:
+        message = "; ".join(item["message"] for item in hook_results if item.get("blocked")) or "patch blocked by hook"
+        return [
+            AppliedPatch(
+                file_path=patch.file_path,
+                operation=patch.operation,
+                success=False,
+                message=f"Patch blocked by hooks: {message}",
+            )
+            for patch in patches
+        ]
 
     def _build_retrieval_trace(
         self,

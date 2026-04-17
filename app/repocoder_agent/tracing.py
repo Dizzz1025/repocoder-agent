@@ -23,6 +23,7 @@ class RunTraceWriter:
         selection_trace: dict | None = None,
         sandbox_trace: dict | None = None,
         retrieval_trace: dict | None = None,
+        hooks_trace: dict | None = None,
     ) -> Path | None:
         if not self.settings.trace_enabled:
             return None
@@ -42,6 +43,7 @@ class RunTraceWriter:
                 "retrieval_trace": retrieval_trace or {},
                 "selection_trace": selection_trace or {},
                 "sandbox_trace": sandbox_trace or {},
+                "hooks_trace": hooks_trace or {},
                 "response": response.model_dump(mode="json"),
             }
             trace_path.write_text(

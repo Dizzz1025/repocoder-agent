@@ -12,6 +12,7 @@ DEFAULT_TRACE_ENABLED = True
 DEFAULT_TRACE_DIRNAME = ".repocoder/runs"
 DEFAULT_DRY_RUN_ENABLED = True
 DEFAULT_GRAPH_DB_PATH = ".repocoder/graph_memory.db"
+DEFAULT_HOOKS_PATH = ".repocoder/hooks.json"
 
 _ENV_LOADED = False
 _LOADED_ENV_KEYS: set[str] = set()
@@ -28,6 +29,7 @@ class Settings:
     trace_dirname: str
     dry_run_enabled: bool
     graph_db_path: str
+    hooks_path: str
 
 
 def load_environment(start_dir: str | Path | None = None) -> None:
@@ -56,6 +58,7 @@ def get_settings(start_dir: str | Path | None = None) -> Settings:
         trace_dirname=os.getenv("REPOCODER_TRACE_DIR", DEFAULT_TRACE_DIRNAME),
         dry_run_enabled=_parse_bool(os.getenv("REPOCODER_DRY_RUN_ENABLED"), DEFAULT_DRY_RUN_ENABLED),
         graph_db_path=os.getenv("REPOCODER_GRAPH_DB_PATH", DEFAULT_GRAPH_DB_PATH),
+        hooks_path=os.getenv("REPOCODER_HOOKS_PATH", DEFAULT_HOOKS_PATH),
     )
 
 

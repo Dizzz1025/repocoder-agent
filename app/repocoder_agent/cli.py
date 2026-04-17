@@ -52,6 +52,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_iterations=args.max_iterations,
                 auto_fix=args.auto_fix,
                 command_timeout_sec=args.command_timeout_sec,
+                mode=args.mode,
             )
         ).run()
         print(_to_json(payload))
@@ -86,6 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--top-k-files", type=int, default=5)
     run.add_argument("--max-iterations", type=int, default=3)
     run.add_argument("--command-timeout-sec", type=int, default=60)
+    run.add_argument("--mode", choices=["execute", "plan"], default="execute")
     run.add_argument("--auto-fix", dest="auto_fix", action="store_true")
     run.add_argument("--no-auto-fix", dest="auto_fix", action="store_false")
     run.set_defaults(commands=None, auto_fix=True)

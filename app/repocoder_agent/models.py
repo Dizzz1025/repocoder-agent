@@ -8,6 +8,7 @@ from .config import DEFAULT_COMMANDS, DEFAULT_COMMAND_TIMEOUT_SEC
 
 
 PatchOperation = Literal["replace", "append", "create"]
+RunMode = Literal["execute", "plan"]
 
 
 def _default_commands() -> list[str]:
@@ -100,6 +101,7 @@ class AgentTaskRequest(BaseModel):
     top_k_files: int = Field(default=5, ge=1, le=30)
     auto_fix: bool = True
     command_timeout_sec: int = Field(default_factory=_default_command_timeout_sec, ge=1, le=600)
+    mode: RunMode = Field(default="execute")
 
 
 class AgentRunResponse(BaseModel):
@@ -111,3 +113,5 @@ class AgentRunResponse(BaseModel):
     command_results: list[CommandResult]
     iterations_used: int
     message: str
+    mode: RunMode = Field(default="execute")
+    proposed_patches: list[PatchInstruction] = Field(default_factory=list)
