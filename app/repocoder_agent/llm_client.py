@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from .config import get_settings
 from .models import CommandResult, PatchInstruction, RelevantFile
@@ -11,6 +11,7 @@ from .repository import RepoFile, RepoSnapshot
 
 MAX_CONTEXT_CHARS = 12_000
 MAX_FILE_CONTEXT_CHARS = 4_000
+GateAction = Literal["allow", "review", "block"]
 
 
 @dataclass
@@ -18,6 +19,13 @@ class LLMRetrySuggestion:
     reflection: str
     retry_prompt: str
     patch: PatchInstruction | None
+
+
+@dataclass
+class LLMUncertaintyReview:
+    action: GateAction
+    reasons: tuple[str, ...] = ()
+    confidence: float | None = None
 
 
 class SupportsRepoCoderLLM(Protocol):
@@ -45,6 +53,15 @@ class SupportsRepoCoderLLM(Protocol):
         relevant_files: list[RelevantFile],
         applied_patch_summaries: list[str],
     ) -> LLMRetrySuggestion | None: ...
+
+    def review_patch_uncertainty(
+        self,
+        goal: str,
+        patch: PatchInstruction,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        phase: str,
+    ) -> LLMUncertaintyReview | None: ...
 
 
 def create_llm_client_from_env(start_dir: str | None = None) -> SupportsRepoCoderLLM | None:
@@ -189,6 +206,60 @@ class OpenAICompatibleLLMClient:
             patch=patch,
         )
 
+    def review_patch_uncertainty(
+        self,
+        goal: str,
+        patch: PatchInstruction,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        phase: str,
+    ) -> LLMUncertaintyReview | None:
+        payload = self._request_json(
+            system_prompt=(
+                "You are the uncertainty gate for RepoCoder-Agent. "
+                "Decide whether a patch is safe to auto-apply. Return strict JSON only."
+            ),
+            user_prompt=(
+                f"Goal: {goal}\n"
+                f"Phase: {phase}\n"
+                f"Patch: {patch.model_dump(exclude_none=True)}\n"
+                f"Relevant files: {self._serialize_relevant_files(relevant_files)}\n\n"
+                f"Repository context:\n{self._serialize_gate_context(snapshot, patch, relevant_files)}\n\n"
+                "Return JSON with this schema only:\n"
+                '{"action": "allow", "reasons": ["short reason"], "confidence": 0.8}\n'
+                "Rules:\n"
+                "- action must be one of: allow, review, block.\n"
+                "- Use allow only when the patch looks low-risk and directly aligned with the goal.\n"
+                "- Use review when the patch might be correct but needs a human check.\n"
+                "- Use block when the patch looks unsafe, weakly supported, or likely wrong.\n"
+                "- Keep reasons concise.\n"
+                "- Do not use markdown."
+            ),
+        )
+        if not isinstance(payload, dict):
+            return None
+
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"allow", "review", "block"}:
+            return None
+
+        reasons_raw = payload.get("reasons")
+        reasons: tuple[str, ...] = ()
+        if isinstance(reasons_raw, list):
+            cleaned = [str(item).strip() for item in reasons_raw if str(item).strip()]
+            reasons = tuple(cleaned)
+
+        confidence_value = payload.get("confidence")
+        confidence: float | None = None
+        if isinstance(confidence_value, (int, float)):
+            confidence = float(confidence_value)
+
+        return LLMUncertaintyReview(
+            action=action,
+            reasons=reasons,
+            confidence=confidence,
+        )
+
     def _request_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any] | None:
         try:
             response = self.client.chat.completions.create(
@@ -261,6 +332,36 @@ class OpenAICompatibleLLMClient:
 
         if not sections:
             return "No relevant file content available."
+        return "\n\n".join(sections)
+
+    def _serialize_gate_context(
+        self,
+        snapshot: RepoSnapshot,
+        patch: PatchInstruction,
+        relevant_files: list[RelevantFile],
+    ) -> str:
+        files_by_path = {item.rel_path: item for item in snapshot.files}
+        sections: list[str] = []
+        seen: set[str] = set()
+
+        target = files_by_path.get(patch.file_path)
+        if target is not None:
+            sections.append(self._format_file_block(target, target.content[:MAX_FILE_CONTEXT_CHARS]))
+            seen.add(target.rel_path)
+
+        for relevant in relevant_files:
+            if relevant.file_path in seen:
+                continue
+            repo_file = files_by_path.get(relevant.file_path)
+            if repo_file is None:
+                continue
+            sections.append(self._format_file_block(repo_file, repo_file.content[:MAX_FILE_CONTEXT_CHARS]))
+            seen.add(repo_file.rel_path)
+            if sum(len(item) for item in sections) > MAX_CONTEXT_CHARS:
+                break
+
+        if not sections:
+            return "No patch context available."
         return "\n\n".join(sections)
 
     def _format_file_block(self, repo_file: RepoFile, snippet: str) -> str:

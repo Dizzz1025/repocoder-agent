@@ -9,6 +9,7 @@ from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
 from .models import AgentRunResponse, AgentTaskRequest, AppliedPatch, CommandResult, PatchInstruction
 from .patcher import PatchApplier
 from .planner import TaskPlanner
+from .policies.uncertainty_gate import UncertaintyDecision, UncertaintyGate
 from .repository import RepoSnapshot, RepositoryScanner
 from .tracing import RunTraceWriter
 
@@ -27,11 +28,12 @@ class RepoCoderAgent:
         self.llm_client = llm_client if llm_client is not None else create_llm_client_from_env(
             start_dir=task.repository_path
         )
-        self.planner = TaskPlanner(llm_client=self.llm_client)
+        self.planner = TaskPlanner(llm_client=self.llm_client, start_dir=task.repository_path)
         self.patcher = PatchApplier(task.repository_path)
         self.executor = CommandExecutor(task.repository_path, timeout_sec=task.command_timeout_sec)
         self.auto_fixer = ErrorAutoFixer(task.repository_path)
         self.trace_writer = RunTraceWriter(task.repository_path)
+        self.uncertainty_gate = UncertaintyGate(llm_client=self.llm_client)
 
     def run(self) -> AgentRunResponse:
         snapshot = self.scanner.scan()
@@ -48,7 +50,7 @@ class RepoCoderAgent:
             auto_fix=self.task.auto_fix,
         )
 
-        applied_patches = []
+        applied_patches: list[AppliedPatch] = []
         command_results = []
 
         initial_patches = list(self.task.patches)
@@ -57,12 +59,26 @@ class RepoCoderAgent:
             if inferred is not None:
                 initial_patches.append(inferred)
 
-        if initial_patches:
-            applied_patches.extend(self.patcher.apply_many(initial_patches))
+        approved_initial_patches: list[PatchInstruction] = []
+        for patch in initial_patches:
+            decision = self.uncertainty_gate.evaluate(
+                patch=patch,
+                relevant_files=relevant_files,
+                phase="initial",
+                goal=self.task.goal,
+                snapshot=snapshot,
+            )
+            if decision.should_apply:
+                approved_initial_patches.append(patch)
+            else:
+                applied_patches.append(self._blocked_patch_result(patch, decision))
+
+        if approved_initial_patches:
+            applied_patches.extend(self.patcher.apply_many(approved_initial_patches))
 
         state = _RunState()
         seen_patch_fingerprints: set[str] = set()
-        for item in initial_patches:
+        for item in approved_initial_patches:
             seen_patch_fingerprints.add(self._patch_fingerprint(item))
 
         for iteration in range(1, self.task.max_iterations + 1):
@@ -80,9 +96,35 @@ class RepoCoderAgent:
                 state.message = "Commands failed and auto_fix is disabled."
                 break
 
-            suggestion = self._suggest_retry_patch(failed, applied_patches)
+            current_snapshot = self.scanner.scan()
+            current_relevant_files = self.scanner.retrieve_relevant_files(
+                snapshot=current_snapshot,
+                goal=self.task.goal,
+                top_k=self.task.top_k_files,
+            )
+            suggestion = self._suggest_retry_patch(
+                failed=failed,
+                applied_patches=applied_patches,
+                current_snapshot=current_snapshot,
+                current_relevant_files=current_relevant_files,
+            )
             if suggestion is None:
                 state.message = "Commands failed and no auto-fix rule matched."
+                break
+
+            decision = self.uncertainty_gate.evaluate(
+                patch=suggestion,
+                relevant_files=current_relevant_files,
+                phase="retry",
+                goal=self.task.goal,
+                snapshot=current_snapshot,
+            )
+            if not decision.should_apply:
+                applied_patches.append(self._blocked_patch_result(suggestion, decision))
+                state.message = (
+                    f"Commands failed; uncertainty gate requires review before applying retry patch: "
+                    f"{decision.summary()}"
+                )
                 break
 
             fingerprint = self._patch_fingerprint(suggestion)
@@ -126,14 +168,10 @@ class RepoCoderAgent:
         self,
         failed: CommandResult,
         applied_patches: list[AppliedPatch],
+        current_snapshot: RepoSnapshot,
+        current_relevant_files,
     ) -> PatchInstruction | None:
         if self.llm_client is not None:
-            current_snapshot = self.scanner.scan()
-            current_relevant_files = self.scanner.retrieve_relevant_files(
-                snapshot=current_snapshot,
-                goal=self.task.goal,
-                top_k=self.task.top_k_files,
-            )
             llm_suggestion = self.llm_client.reflect_and_suggest_fix(
                 goal=self.task.goal,
                 command_result=failed,
@@ -194,6 +232,18 @@ class RepoCoderAgent:
                 replace_text=generic.group(2),
             )
         return None
+
+    def _blocked_patch_result(
+        self,
+        patch: PatchInstruction,
+        decision: UncertaintyDecision,
+    ) -> AppliedPatch:
+        return AppliedPatch(
+            file_path=patch.file_path,
+            operation=patch.operation,
+            success=False,
+            message=f"Patch blocked by uncertainty gate ({decision.action}): {decision.summary()}",
+        )
 
     def _summarize_applied_patch(self, patch: AppliedPatch) -> str:
         return (
