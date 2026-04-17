@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from ..config import get_settings
-from .graph_builder import GraphEdge, GraphNode, RepositoryGraph
+from ..repository import RepoSnapshot
+from .graph_builder import GraphEdge, GraphNode, RepositoryGraph, RepositoryGraphBuilder
 
 
 class RepositoryGraphStore:
@@ -21,6 +23,7 @@ class RepositoryGraphStore:
             self._ensure_schema(connection)
             connection.execute('DELETE FROM nodes')
             connection.execute('DELETE FROM edges')
+            connection.execute('DELETE FROM file_hashes')
             connection.executemany(
                 'INSERT INTO nodes (node_id, node_type, name, file_path, lineno) VALUES (?, ?, ?, ?, ?)',
                 [
@@ -35,6 +38,10 @@ class RepositoryGraphStore:
                     for edge in graph.edges
                 ],
             )
+            connection.executemany(
+                'INSERT INTO file_hashes (file_path, content_hash) VALUES (?, ?)',
+                list(graph.file_hashes),
+            )
             connection.commit()
 
     def load(self) -> RepositoryGraph | None:
@@ -47,6 +54,9 @@ class RepositoryGraphStore:
             ).fetchall()
             edge_rows = connection.execute(
                 'SELECT source_id, target_id, edge_type FROM edges ORDER BY rowid'
+            ).fetchall()
+            file_hash_rows = connection.execute(
+                'SELECT file_path, content_hash FROM file_hashes ORDER BY file_path'
             ).fetchall()
         if not node_rows:
             return None
@@ -70,7 +80,54 @@ class RepositoryGraphStore:
                 )
                 for row in edge_rows
             ),
+            file_hashes=tuple((row[0], row[1]) for row in file_hash_rows),
         )
+
+    def diff(self, snapshot: RepoSnapshot) -> dict[str, Any]:
+        existing = self.load()
+        current_hashes = {item.rel_path: item.content_hash for item in snapshot.files}
+        if existing is None: # 说明这是第一次建图, 所以不能复用旧图, 需要重新建图
+            return {
+                'reused': False,
+                'changed_files': sorted(current_hashes.keys()),
+                'removed_files': [],
+                'unchanged_files': 0,
+            }
+        stored_hashes = existing.file_hash_map()
+        changed_files = [
+            path for path, content_hash in current_hashes.items()
+            if stored_hashes.get(path) != content_hash
+        ]
+        removed_files = [path for path in stored_hashes if path not in current_hashes]
+        unchanged_files = len(current_hashes) - len(changed_files)
+        return {
+            'reused': not changed_files and not removed_files,
+            'changed_files': sorted(changed_files),
+            'removed_files': sorted(removed_files),
+            'unchanged_files': unchanged_files,
+        }
+
+    def refresh(
+        self,
+        snapshot: RepoSnapshot,
+        builder: RepositoryGraphBuilder,
+    ) -> tuple[RepositoryGraph, dict[str, Any]]:
+        diff = self.diff(snapshot)
+        loaded = self.load()
+        if diff['reused'] and loaded is not None:
+            return loaded, diff
+
+        if loaded is None:
+            graph = builder.build_from_snapshot(snapshot)
+        else:
+            graph = builder.update_graph(
+                base_graph=loaded,
+                snapshot=snapshot,
+                changed_files=diff['changed_files'],
+                removed_files=diff['removed_files'],
+            )
+        self.save(graph)
+        return graph, diff
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
@@ -90,6 +147,14 @@ class RepositoryGraphStore:
                 source_id TEXT NOT NULL,
                 target_id TEXT NOT NULL,
                 edge_type TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                file_path TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL
             )
             """
         )

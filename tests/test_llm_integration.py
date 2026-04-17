@@ -214,7 +214,9 @@ def test_agent_writes_trace_artifact(tmp_path: Path, monkeypatch) -> None:
     assert payload["request"]["goal"] == task.goal
     assert payload["response"]["success"] is True
     assert payload["retrieval_trace"]["graph_summary"]["files"] >= 1
+    assert "graph_diff" in payload["retrieval_trace"]
     assert payload["retrieval_trace"]["relevant_files"]
+    assert "score_breakdown" in payload["retrieval_trace"]["relevant_files"][0]
     assert payload["selection_trace"]["initial"]
     initial_trace = payload["selection_trace"]["initial"][0]
     assert initial_trace["selected_patch"]["file_path"] == "check.py"

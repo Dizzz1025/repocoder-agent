@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import RelevantFile, RepositorySummary
@@ -27,6 +28,7 @@ MAX_FILE_BYTES = 512_000
 class RepoFile:
     rel_path: str
     content: str
+    content_hash: str = ""
 
 
 @dataclass
@@ -76,7 +78,13 @@ class RepositoryScanner:
                 continue
 
             rel_path = str(path.relative_to(self.repo_root)).replace('\\', '/')
-            indexed_files.append(RepoFile(rel_path=rel_path, content=content))
+            indexed_files.append(
+                RepoFile(
+                    rel_path=rel_path,
+                    content=content,
+                    content_hash=hashlib.sha256(content.encode('utf-8')).hexdigest(),
+                )
+            )
 
         summary = RepositorySummary(
             repo_path=str(self.repo_root),

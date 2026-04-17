@@ -18,8 +18,9 @@ def test_hybrid_retriever_prefers_symbol_match(tmp_path) -> None:
     scanner = RepositoryScanner(str(tmp_path))
     snapshot = scanner.scan()
     graph = RepositoryGraphBuilder().build_from_snapshot(snapshot)
-    relevant = HybridRetriever().retrieve(snapshot, "fix parse token parser", graph, top_k=2)
+    retrieval = HybridRetriever().retrieve_with_details(snapshot, "fix parse token parser", graph, top_k=2)
 
-    assert relevant
-    assert relevant[0].file_path == "best.py"
-    assert "graph symbol match" in relevant[0].reason
+    assert retrieval.relevant_files
+    assert retrieval.relevant_files[0].file_path == "best.py"
+    assert "graph symbol match" in retrieval.relevant_files[0].reason
+    assert retrieval.evaluations[0].score_breakdown["graph_symbol_bonus"] > 0

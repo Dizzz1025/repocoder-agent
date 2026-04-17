@@ -54,9 +54,8 @@ class RepoCoderAgent:
 
     def run(self) -> AgentRunResponse:
         snapshot = self.scanner.scan()
-        graph = self.graph_builder.build_from_snapshot(snapshot)
-        self.graph_store.save(graph)
-        relevant_files = self.hybrid_retriever.retrieve(
+        graph, graph_diff = self.graph_store.refresh(snapshot, self.graph_builder)
+        retrieval_result = self.hybrid_retriever.retrieve_with_details(
             snapshot=snapshot,
             goal=self.task.goal,
             graph=graph,
@@ -66,7 +65,9 @@ class RepoCoderAgent:
             command_failure_counts=self.history_store.command_failure_counts(),
             patch_history_events=self.history_store.patch_history_events(),
             command_failure_events=self.history_store.command_failure_events(),
+            file_memory=self.history_store.file_memory(),
         )
+        relevant_files = list(retrieval_result.relevant_files)
         plan_steps = self.planner.build_plan(
             goal=self.task.goal,
             relevant_files=relevant_files,
@@ -79,7 +80,8 @@ class RepoCoderAgent:
         command_results = []
         retrieval_trace = self._build_retrieval_trace(
             graph=graph,
-            relevant_files=relevant_files,
+            graph_diff=graph_diff,
+            retrieval_result=retrieval_result,
         )
         selection_trace: dict[str, list[dict] | dict] = {
             "initial": [],
@@ -158,9 +160,8 @@ class RepoCoderAgent:
                 break
 
             current_snapshot = self.scanner.scan()
-            current_graph = self.graph_builder.build_from_snapshot(current_snapshot)
-            self.graph_store.save(current_graph)
-            current_relevant_files = self.hybrid_retriever.retrieve(
+            current_graph, current_graph_diff = self.graph_store.refresh(current_snapshot, self.graph_builder)
+            current_retrieval_result = self.hybrid_retriever.retrieve_with_details(
                 snapshot=current_snapshot,
                 goal=self.task.goal,
                 graph=current_graph,
@@ -168,6 +169,17 @@ class RepoCoderAgent:
                 patch_success_counts=self.history_store.patch_success_counts(),
                 patch_failure_counts=self.history_store.patch_failure_counts(),
                 command_failure_counts=self.history_store.command_failure_counts(),
+                patch_history_events=self.history_store.patch_history_events(),
+                command_failure_events=self.history_store.command_failure_events(),
+            file_memory=self.history_store.file_memory(),
+            )
+            current_relevant_files = list(current_retrieval_result.relevant_files)
+            retrieval_trace.setdefault("retry", []).append(
+                self._build_retrieval_trace(
+                    graph=current_graph,
+                    graph_diff=current_graph_diff,
+                    retrieval_result=current_retrieval_result,
+                )
             )
             retry_selection = self._select_retry_patch(
                 failed=failed,
@@ -424,10 +436,12 @@ class RepoCoderAgent:
     def _build_retrieval_trace(
         self,
         graph,
-        relevant_files,
+        graph_diff,
+        retrieval_result,
     ) -> dict:
         return {
             "graph_summary": graph.summary(),
+            "graph_diff": graph_diff,
             "history_summary": {
                 "patch_success_counts": self.history_store.patch_success_counts(),
                 "patch_failure_counts": self.history_store.patch_failure_counts(),
@@ -438,10 +452,11 @@ class RepoCoderAgent:
             "relevant_files": [
                 {
                     "file_path": item.file_path,
-                    "score": item.score,
+                    "score": item.total_score,
                     "reason": item.reason,
+                    "score_breakdown": item.score_breakdown,
                 }
-                for item in relevant_files
+                for item in retrieval_result.evaluations
             ],
         }
 

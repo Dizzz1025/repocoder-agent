@@ -66,6 +66,7 @@ def plan_task(request: PlanRequest) -> PlanResponse:
         command_failure_counts=history_store.command_failure_counts(),
         patch_history_events=history_store.patch_history_events(),
         command_failure_events=history_store.command_failure_events(),
+        file_memory=history_store.file_memory(),
     )
     planner = TaskPlanner(start_dir=request.repository_path)
     plan_steps = planner.build_plan(
