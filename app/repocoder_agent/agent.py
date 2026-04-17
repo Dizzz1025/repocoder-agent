@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from .autofix import ErrorAutoFixer
+from .critics.patch_critic import PatchCritic, PatchCritique
 from .executor import CommandExecutor
 from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
 from .models import AgentRunResponse, AgentTaskRequest, AppliedPatch, CommandResult, PatchInstruction
@@ -34,6 +35,7 @@ class RepoCoderAgent:
         self.auto_fixer = ErrorAutoFixer(task.repository_path)
         self.trace_writer = RunTraceWriter(task.repository_path)
         self.uncertainty_gate = UncertaintyGate(llm_client=self.llm_client)
+        self.patch_critic = PatchCritic(llm_client=self.llm_client)
 
     def run(self) -> AgentRunResponse:
         snapshot = self.scanner.scan()
@@ -61,17 +63,16 @@ class RepoCoderAgent:
 
         approved_initial_patches: list[PatchInstruction] = []
         for patch in initial_patches:
-            decision = self.uncertainty_gate.evaluate(
+            approved, blocked_result = self._approve_patch_candidate(
                 patch=patch,
                 relevant_files=relevant_files,
-                phase="initial",
-                goal=self.task.goal,
                 snapshot=snapshot,
+                phase="initial",
             )
-            if decision.should_apply:
+            if approved:
                 approved_initial_patches.append(patch)
-            else:
-                applied_patches.append(self._blocked_patch_result(patch, decision))
+            elif blocked_result is not None:
+                applied_patches.append(blocked_result)
 
         if approved_initial_patches:
             applied_patches.extend(self.patcher.apply_many(approved_initial_patches))
@@ -112,19 +113,18 @@ class RepoCoderAgent:
                 state.message = "Commands failed and no auto-fix rule matched."
                 break
 
-            decision = self.uncertainty_gate.evaluate(
+            approved, blocked_result = self._approve_patch_candidate(
                 patch=suggestion,
                 relevant_files=current_relevant_files,
-                phase="retry",
-                goal=self.task.goal,
                 snapshot=current_snapshot,
+                phase="retry",
             )
-            if not decision.should_apply:
-                applied_patches.append(self._blocked_patch_result(suggestion, decision))
-                state.message = (
-                    f"Commands failed; uncertainty gate requires review before applying retry patch: "
-                    f"{decision.summary()}"
-                )
+            if not approved:
+                if blocked_result is not None:
+                    applied_patches.append(blocked_result)
+                    state.message = blocked_result.message
+                else:
+                    state.message = "Commands failed; patch approval pipeline rejected the retry patch."
                 break
 
             fingerprint = self._patch_fingerprint(suggestion)
@@ -163,6 +163,40 @@ class RepoCoderAgent:
             response=response,
         )
         return response
+
+    def _approve_patch_candidate(
+        self,
+        patch: PatchInstruction,
+        relevant_files,
+        snapshot: RepoSnapshot,
+        phase: str,
+    ) -> tuple[bool, AppliedPatch | None]:
+        gate_decision = self.uncertainty_gate.evaluate(
+            patch=patch,
+            relevant_files=relevant_files,
+            phase=phase,
+            goal=self.task.goal,
+            snapshot=snapshot,
+        )
+        if not gate_decision.should_apply:
+            return False, self._blocked_patch_result(
+                patch=patch,
+                source="uncertainty gate",
+                action=gate_decision.action,
+                summary=gate_decision.summary(),
+            )
+
+        critique = self.patch_critic.evaluate(
+            patch=patch,
+            relevant_files=relevant_files,
+            snapshot=snapshot,
+            phase=phase,
+            goal=self.task.goal,
+        )
+        if not critique.should_apply:
+            return False, self._critic_blocked_patch_result(patch, critique)
+
+        return True, None
 
     def _suggest_retry_patch(
         self,
@@ -236,13 +270,27 @@ class RepoCoderAgent:
     def _blocked_patch_result(
         self,
         patch: PatchInstruction,
-        decision: UncertaintyDecision,
+        source: str,
+        action: str,
+        summary: str,
     ) -> AppliedPatch:
         return AppliedPatch(
             file_path=patch.file_path,
             operation=patch.operation,
             success=False,
-            message=f"Patch blocked by uncertainty gate ({decision.action}): {decision.summary()}",
+            message=f"Patch blocked by {source} ({action}): {summary}",
+        )
+
+    def _critic_blocked_patch_result(
+        self,
+        patch: PatchInstruction,
+        critique: PatchCritique,
+    ) -> AppliedPatch:
+        return self._blocked_patch_result(
+            patch=patch,
+            source="patch critic",
+            action=critique.action,
+            summary=critique.summary(),
         )
 
     def _summarize_applied_patch(self, patch: AppliedPatch) -> str:

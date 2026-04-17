@@ -12,6 +12,7 @@ from .repository import RepoFile, RepoSnapshot
 MAX_CONTEXT_CHARS = 12_000
 MAX_FILE_CONTEXT_CHARS = 4_000
 GateAction = Literal["allow", "review", "block"]
+CriticAction = Literal["apply", "review", "reject"]
 
 
 @dataclass
@@ -26,6 +27,13 @@ class LLMUncertaintyReview:
     action: GateAction
     reasons: tuple[str, ...] = ()
     confidence: float | None = None
+
+
+@dataclass
+class LLMPatchCritique:
+    action: CriticAction
+    reasons: tuple[str, ...] = ()
+    score: float | None = None
 
 
 class SupportsRepoCoderLLM(Protocol):
@@ -62,6 +70,15 @@ class SupportsRepoCoderLLM(Protocol):
         relevant_files: list[RelevantFile],
         phase: str,
     ) -> LLMUncertaintyReview | None: ...
+
+    def critique_patch(
+        self,
+        goal: str,
+        patch: PatchInstruction,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        phase: str,
+    ) -> LLMPatchCritique | None: ...
 
 
 def create_llm_client_from_env(start_dir: str | None = None) -> SupportsRepoCoderLLM | None:
@@ -258,6 +275,60 @@ class OpenAICompatibleLLMClient:
             action=action,
             reasons=reasons,
             confidence=confidence,
+        )
+
+    def critique_patch(
+        self,
+        goal: str,
+        patch: PatchInstruction,
+        snapshot: RepoSnapshot,
+        relevant_files: list[RelevantFile],
+        phase: str,
+    ) -> LLMPatchCritique | None:
+        payload = self._request_json(
+            system_prompt=(
+                "You are the patch critic for RepoCoder-Agent. "
+                "Evaluate whether a patch is good enough for automatic execution. Return strict JSON only."
+            ),
+            user_prompt=(
+                f"Goal: {goal}\n"
+                f"Phase: {phase}\n"
+                f"Patch: {patch.model_dump(exclude_none=True)}\n"
+                f"Relevant files: {self._serialize_relevant_files(relevant_files)}\n\n"
+                f"Repository context:\n{self._serialize_gate_context(snapshot, patch, relevant_files)}\n\n"
+                "Return JSON with this schema only:\n"
+                '{"action": "apply", "reasons": ["short reason"], "score": 0.8}\n'
+                "Rules:\n"
+                "- action must be one of: apply, review, reject.\n"
+                "- Use apply only when the patch looks precise, minimal, and directly aligned with the goal.\n"
+                "- Use review when the patch might be valid but quality is uncertain.\n"
+                "- Use reject when the patch looks weak, ambiguous, or likely incorrect.\n"
+                "- Keep reasons concise.\n"
+                "- Do not use markdown."
+            ),
+        )
+        if not isinstance(payload, dict):
+            return None
+
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"apply", "review", "reject"}:
+            return None
+
+        reasons_raw = payload.get("reasons")
+        reasons: tuple[str, ...] = ()
+        if isinstance(reasons_raw, list):
+            cleaned = [str(item).strip() for item in reasons_raw if str(item).strip()]
+            reasons = tuple(cleaned)
+
+        score_value = payload.get("score")
+        score: float | None = None
+        if isinstance(score_value, (int, float)):
+            score = float(score_value)
+
+        return LLMPatchCritique(
+            action=action,
+            reasons=reasons,
+            score=score,
         )
 
     def _request_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any] | None:
