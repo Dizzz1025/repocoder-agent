@@ -3,6 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .agents.patch_reviewer_agent import PatchReviewerAgent
+from .agents.planner_agent import PlannerAgent
+from .agents.repo_explorer_agent import RepoExplorerAgent
 from .autofix import ErrorAutoFixer
 from .critics.patch_critic import PatchCritic, PatchCritique
 from .executor import CommandExecutor
@@ -55,31 +58,35 @@ class RepoCoderAgent:
         )
         self.dry_run_sandbox = DryRunSandbox(task.repository_path, timeout_sec=task.command_timeout_sec)
         self.skill_loader = SkillLoader(task.repository_path)
+        self.repo_explorer_agent = RepoExplorerAgent(
+            scanner=self.scanner,
+            graph_store=self.graph_store,
+            graph_builder=self.graph_builder,
+            history_store=self.history_store,
+            retriever=self.hybrid_retriever,
+        )
+        self.planner_agent = PlannerAgent(self.planner)
+        self.patch_reviewer_agent = PatchReviewerAgent(self.patch_selector)
 
     def run(self) -> AgentRunResponse:
-        snapshot = self.scanner.scan()
-        graph, graph_diff = self.graph_store.refresh(snapshot, self.graph_builder)
         effective_goal = self._goal_with_skill_context()
-        retrieval_result = self.hybrid_retriever.retrieve_with_details(
-            snapshot=snapshot,
+        initial_exploration = self.repo_explorer_agent.explore(
             goal=effective_goal,
-            graph=graph,
-            top_k=self.task.top_k_files,
-            patch_success_counts=self.history_store.patch_success_counts(),
-            patch_failure_counts=self.history_store.patch_failure_counts(),
-            command_failure_counts=self.history_store.command_failure_counts(),
-            patch_history_events=self.history_store.patch_history_events(),
-            command_failure_events=self.history_store.command_failure_events(),
-            file_memory=self.history_store.file_memory(),
+            top_k_files=self.task.top_k_files,
         )
+        snapshot = initial_exploration.snapshot
+        graph = initial_exploration.graph
+        graph_diff = initial_exploration.graph_diff
+        retrieval_result = initial_exploration.retrieval_result
         relevant_files = list(retrieval_result.relevant_files)
-        plan_steps = self.planner.build_plan(
+        plan_result = self.planner_agent.create_plan(
             goal=effective_goal,
             relevant_files=relevant_files,
             commands=self.task.commands,
             patches=self.task.patches,
             auto_fix=self.task.auto_fix,
         )
+        plan_steps = list(plan_result.plan_steps)
 
         applied_patches: list[AppliedPatch] = []
         command_results = []
@@ -257,20 +264,14 @@ class RepoCoderAgent:
                 state.message = "Commands failed and auto_fix is disabled."
                 break
 
-            current_snapshot = self.scanner.scan()
-            current_graph, current_graph_diff = self.graph_store.refresh(current_snapshot, self.graph_builder)
-            current_retrieval_result = self.hybrid_retriever.retrieve_with_details(
-                snapshot=current_snapshot,
+            current_exploration = self.repo_explorer_agent.explore(
                 goal=effective_goal,
-                graph=current_graph,
-                top_k=self.task.top_k_files,
-                patch_success_counts=self.history_store.patch_success_counts(),
-                patch_failure_counts=self.history_store.patch_failure_counts(),
-                command_failure_counts=self.history_store.command_failure_counts(),
-                patch_history_events=self.history_store.patch_history_events(),
-                command_failure_events=self.history_store.command_failure_events(),
-                file_memory=self.history_store.file_memory(),
+                top_k_files=self.task.top_k_files,
             )
+            current_snapshot = current_exploration.snapshot
+            current_graph = current_exploration.graph
+            current_graph_diff = current_exploration.graph_diff
+            current_retrieval_result = current_exploration.retrieval_result
             current_relevant_files = list(current_retrieval_result.relevant_files)
             retrieval_trace.setdefault("retry", []).append(
                 self._build_retrieval_trace(
@@ -422,13 +423,13 @@ class RepoCoderAgent:
         relevant_files,
     ) -> PatchSelectionResult:
         candidates = self._collect_initial_patch_candidates(snapshot, relevant_files)
-        return self.patch_selector.select(
+        return self.patch_reviewer_agent.review_candidates(
             candidates=candidates,
             relevant_files=relevant_files,
             snapshot=snapshot,
             goal=self.task.goal,
             phase="initial",
-        )
+        ).selection
 
     def _select_retry_patch(
         self,
@@ -443,13 +444,13 @@ class RepoCoderAgent:
             current_snapshot=current_snapshot,
             current_relevant_files=current_relevant_files,
         )
-        return self.patch_selector.select(
+        return self.patch_reviewer_agent.review_candidates(
             candidates=candidates,
             relevant_files=current_relevant_files,
             snapshot=current_snapshot,
             goal=self.task.goal,
             phase="retry",
-        )
+        ).selection
 
     def _collect_initial_patch_candidates(
         self,
