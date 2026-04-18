@@ -10,6 +10,10 @@ from .agent import RepoCoderAgent
 from .memory.graph_builder import RepositoryGraphBuilder
 from .memory.graph_store import RepositoryGraphStore
 from .memory.history_store import RepositoryHistoryStore
+from .tools.mcp_client import MCPClientRuntime
+from .tools.mcp_config import MCPConfigLoader
+from .tools.adapters.local_tools import register_local_tools
+from .tools.registry import ToolRegistry
 from .models import AgentTaskRequest, PlanRequest, ScanRequest
 from .skills.loader import SkillLoader
 from .planner import TaskPlanner
@@ -24,6 +28,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = getattr(args, "command", None)
     if command in {None, "serve"}:
         _serve(host=getattr(args, "host", "127.0.0.1"), port=getattr(args, "port", 8000))
+        return 0
+
+    if command == "mcp":
+        loader = MCPConfigLoader(args.repository_path)
+        if args.mcp_command == "list":
+            payload = _mcp_list(loader)
+        elif args.mcp_command == "show":
+            payload = _mcp_show(loader, args.name)
+        elif args.mcp_command == "tools":
+            payload = _mcp_tools(MCPClientRuntime(args.repository_path), args.name)
+        else:
+            payload = _mcp_call(MCPClientRuntime(args.repository_path), args.name, args.tool, args.arguments)
+        print(_to_json(payload))
+        return 0
+
+    if command == "tools":
+        registry = ToolRegistry()
+        register_local_tools(registry)
+        if args.tools_command == "list":
+            payload = _tools_list(registry)
+        else:
+            payload = _tools_show(registry, args.name)
+        print(_to_json(payload))
         return 0
 
     if command == "skills":
@@ -80,6 +107,25 @@ def _build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="Start the FastAPI server")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+
+    mcp = subparsers.add_parser("mcp", help="Inspect MCP server configuration")
+    mcp.add_argument("repository_path")
+    mcp_subparsers = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_subparsers.add_parser("list", help="List MCP servers from .mcp.json")
+    mcp_show = mcp_subparsers.add_parser("show", help="Show an MCP server config")
+    mcp_show.add_argument("name")
+    mcp_tools = mcp_subparsers.add_parser("tools", help="List tools exposed by an MCP server")
+    mcp_tools.add_argument("name")
+    mcp_call = mcp_subparsers.add_parser("call", help="Call a tool exposed by an MCP server")
+    mcp_call.add_argument("name")
+    mcp_call.add_argument("tool")
+    mcp_call.add_argument("--arguments", default='{}')
+
+    tools = subparsers.add_parser("tools", help="Inspect available tools")
+    tools_subparsers = tools.add_subparsers(dest="tools_command", required=True)
+    tools_subparsers.add_parser("list", help="List tools")
+    tool_show = tools_subparsers.add_parser("show", help="Show a tool")
+    tool_show.add_argument("name")
 
     skills = subparsers.add_parser("skills", help="Inspect available skills")
     skills.add_argument("repository_path")
@@ -212,5 +258,88 @@ def _skills_show(repository_path: str, name: str):
                 for resource in skill.resources
             ],
             "content": skill.content,
+        }
+    }
+
+
+def _tools_list(registry: ToolRegistry):
+    return {
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "schema": tool.schema,
+            }
+            for tool in registry.list_tools()
+        ]
+    }
+
+
+
+def _tools_show(registry: ToolRegistry, name: str):
+    tool = registry.get(name)
+    return {
+        "tool": None if tool is None else {
+            "name": tool.name,
+            "description": tool.description,
+            "schema": tool.schema,
+        }
+    }
+
+
+def _mcp_list(loader: MCPConfigLoader):
+    return {
+        "servers": [
+            {
+                "name": server.name,
+                "transport": server.transport,
+                "command": server.command,
+                "args": list(server.args),
+                "url": server.url,
+            }
+            for server in loader.list_servers()
+        ]
+    }
+
+
+
+def _mcp_show(loader: MCPConfigLoader, name: str):
+    server = loader.get_server(name)
+    return {
+        "server": None if server is None else {
+            "name": server.name,
+            "transport": server.transport,
+            "command": server.command,
+            "args": list(server.args),
+            "env": server.env,
+            "url": server.url,
+            "headers": server.headers,
+        }
+    }
+
+
+def _mcp_tools(runtime: MCPClientRuntime, server_name: str):
+    return {
+        "tools": [
+            {
+                "server": tool.server_name,
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in runtime.list_tools(server_name)
+        ]
+    }
+
+
+def _mcp_call(runtime: MCPClientRuntime, server_name: str, tool_name: str, arguments_text: str):
+    arguments = json.loads(arguments_text)
+    result = runtime.call_tool(server_name, tool_name, arguments)
+    return {
+        "result": {
+            "server": result.server_name,
+            "tool": result.tool_name,
+            "content": result.content,
+            "structured_content": result.structured_content,
         }
     }

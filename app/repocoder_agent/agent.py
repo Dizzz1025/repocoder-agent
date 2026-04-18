@@ -10,6 +10,8 @@ from .autofix import ErrorAutoFixer
 from .critics.patch_critic import PatchCritic, PatchCritique
 from .executor import CommandExecutor
 from .hooks.manager import HookManager
+from .tools.adapters.local_tools import register_local_tools
+from .tools.registry import ToolRegistry
 from .llm_client import SupportsRepoCoderLLM, create_llm_client_from_env
 from .memory.graph_builder import RepositoryGraphBuilder
 from .memory.graph_store import RepositoryGraphStore
@@ -58,6 +60,8 @@ class RepoCoderAgent:
         )
         self.dry_run_sandbox = DryRunSandbox(task.repository_path, timeout_sec=task.command_timeout_sec)
         self.skill_loader = SkillLoader(task.repository_path)
+        self.tool_registry = ToolRegistry()
+        register_local_tools(self.tool_registry)
         self.repo_explorer_agent = RepoExplorerAgent(
             scanner=self.scanner,
             graph_store=self.graph_store,
