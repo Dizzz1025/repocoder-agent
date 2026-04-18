@@ -11,6 +11,7 @@ from .memory.graph_builder import RepositoryGraphBuilder
 from .memory.graph_store import RepositoryGraphStore
 from .memory.history_store import RepositoryHistoryStore
 from .models import AgentTaskRequest, PlanRequest, ScanRequest
+from .skills.loader import SkillLoader
 from .planner import TaskPlanner
 from .repository import RepositoryScanner
 from .retrieval.hybrid_retriever import HybridRetriever
@@ -25,6 +26,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _serve(host=getattr(args, "host", "127.0.0.1"), port=getattr(args, "port", 8000))
         return 0
 
+    if command == "skills":
+        if args.skills_command == "list":
+            payload = _skills_list(args.repository_path)
+        else:
+            payload = _skills_show(args.repository_path, args.name)
+        print(_to_json(payload))
+        return 0
+
     if command == "scan":
         payload = _scan_repository(ScanRequest(repository_path=args.repository_path))
         print(_to_json(payload))
@@ -37,6 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 goal=args.goal,
                 commands=args.commands,
                 top_k_files=args.top_k_files,
+                skill=args.skill,
             )
         )
         print(_to_json(payload))
@@ -50,6 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 commands=args.commands,
                 top_k_files=args.top_k_files,
                 max_iterations=args.max_iterations,
+                skill=args.skill,
                 auto_fix=args.auto_fix,
                 command_timeout_sec=args.command_timeout_sec,
                 mode=args.mode,
@@ -70,6 +81,13 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
 
+    skills = subparsers.add_parser("skills", help="Inspect available skills")
+    skills.add_argument("repository_path")
+    skills_subparsers = skills.add_subparsers(dest="skills_command", required=True)
+    skills_subparsers.add_parser("list", help="List skills")
+    show = skills_subparsers.add_parser("show", help="Show a skill")
+    show.add_argument("name")
+
     scan = subparsers.add_parser("scan", help="Scan a repository")
     scan.add_argument("repository_path")
 
@@ -78,6 +96,7 @@ def _build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--goal", required=True)
     plan.add_argument("--command", dest="commands", action="append")
     plan.add_argument("--top-k-files", type=int, default=5)
+    plan.add_argument("--skill")
     plan.set_defaults(commands=None)
 
     run = subparsers.add_parser("run", help="Execute the full agent loop")
@@ -87,6 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--top-k-files", type=int, default=5)
     run.add_argument("--max-iterations", type=int, default=3)
     run.add_argument("--command-timeout-sec", type=int, default=60)
+    run.add_argument("--skill")
     run.add_argument("--mode", choices=["execute", "plan"], default="execute")
     run.add_argument("--auto-fix", dest="auto_fix", action="store_true")
     run.add_argument("--no-auto-fix", dest="auto_fix", action="store_false")
@@ -148,3 +168,49 @@ def _to_json(payload) -> str:
     if hasattr(payload, "model_dump"):
         payload = payload.model_dump(mode="json")
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _skills_list(repository_path: str):
+    loader = SkillLoader(repository_path)
+    return {
+        "skills": [
+            {
+                "name": skill.name,
+                "path": skill.path,
+                "title": skill.title,
+                "summary": skill.summary,
+                "tags": list(skill.tags),
+                "resources": [
+                    {
+                        "path": resource.relative_path,
+                        "type": resource.resource_type,
+                    }
+                    for resource in skill.resources
+                ],
+            }
+            for skill in loader.list_skills()
+        ]
+    }
+
+
+
+def _skills_show(repository_path: str, name: str):
+    loader = SkillLoader(repository_path)
+    skill = loader.get_skill(name)
+    return {
+        "skill": None if skill is None else {
+            "name": skill.name,
+            "path": skill.path,
+            "title": skill.title,
+            "summary": skill.summary,
+            "tags": list(skill.tags),
+            "resources": [
+                {
+                    "path": resource.relative_path,
+                    "type": resource.resource_type,
+                }
+                for resource in skill.resources
+            ],
+            "content": skill.content,
+        }
+    }

@@ -18,6 +18,7 @@ from .policies.uncertainty_gate import UncertaintyDecision, UncertaintyGate
 from .repository import RepoSnapshot, RepositoryScanner
 from .retrieval.hybrid_retriever import HybridRetriever
 from .sandbox import DryRunResult, DryRunSandbox
+from .skills.loader import SkillLoader
 from .selectors.patch_selector import PatchSelectionResult, PatchSelector
 from .tracing import RunTraceWriter
 
@@ -53,13 +54,15 @@ class RepoCoderAgent:
             patch_critic=self.patch_critic,
         )
         self.dry_run_sandbox = DryRunSandbox(task.repository_path, timeout_sec=task.command_timeout_sec)
+        self.skill_loader = SkillLoader(task.repository_path)
 
     def run(self) -> AgentRunResponse:
         snapshot = self.scanner.scan()
         graph, graph_diff = self.graph_store.refresh(snapshot, self.graph_builder)
+        effective_goal = self._goal_with_skill_context()
         retrieval_result = self.hybrid_retriever.retrieve_with_details(
             snapshot=snapshot,
-            goal=self.task.goal,
+            goal=effective_goal,
             graph=graph,
             top_k=self.task.top_k_files,
             patch_success_counts=self.history_store.patch_success_counts(),
@@ -71,7 +74,7 @@ class RepoCoderAgent:
         )
         relevant_files = list(retrieval_result.relevant_files)
         plan_steps = self.planner.build_plan(
-            goal=self.task.goal,
+            goal=effective_goal,
             relevant_files=relevant_files,
             commands=self.task.commands,
             patches=self.task.patches,
@@ -258,7 +261,7 @@ class RepoCoderAgent:
             current_graph, current_graph_diff = self.graph_store.refresh(current_snapshot, self.graph_builder)
             current_retrieval_result = self.hybrid_retriever.retrieve_with_details(
                 snapshot=current_snapshot,
-                goal=self.task.goal,
+                goal=effective_goal,
                 graph=current_graph,
                 top_k=self.task.top_k_files,
                 patch_success_counts=self.history_store.patch_success_counts(),
@@ -266,7 +269,7 @@ class RepoCoderAgent:
                 command_failure_counts=self.history_store.command_failure_counts(),
                 patch_history_events=self.history_store.patch_history_events(),
                 command_failure_events=self.history_store.command_failure_events(),
-            file_memory=self.history_store.file_memory(),
+                file_memory=self.history_store.file_memory(),
             )
             current_relevant_files = list(current_retrieval_result.relevant_files)
             retrieval_trace.setdefault("retry", []).append(
@@ -559,6 +562,13 @@ class RepoCoderAgent:
                 )
         return default if not details else default + " | " + " | ".join(details)
 
+    def _goal_with_skill_context(self) -> str:
+        if not self.task.skill:
+            return self.task.goal
+        skill = self.skill_loader.get_skill(self.task.skill)
+        if skill is None:
+            return self.task.goal
+        return f"{self.task.goal}\n\nSkill Context ({skill.name}):\n{skill.content}"
     def _run_hooks(
         self,
         event: str,

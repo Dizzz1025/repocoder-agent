@@ -1,0 +1,6 @@
+{
+  "name": "python-bugfix",
+  "title": "Python Bugfix",
+  "summary": "Fix Python bugs safely with small, reviewable changes.",
+  "tags": ["python", "bugfix", "minimal-patch"]
+}

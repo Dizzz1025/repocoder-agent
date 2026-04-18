@@ -102,6 +102,7 @@ class AgentTaskRequest(BaseModel):
     auto_fix: bool = True
     command_timeout_sec: int = Field(default_factory=_default_command_timeout_sec, ge=1, le=600)
     mode: RunMode = Field(default="execute")
+    skill: str | None = None
 
 
 class AgentRunResponse(BaseModel):
@@ -114,4 +115,5 @@ class AgentRunResponse(BaseModel):
     iterations_used: int
     message: str
     mode: RunMode = Field(default="execute")
+    skill: str | None = None
     proposed_patches: list[PatchInstruction] = Field(default_factory=list)
